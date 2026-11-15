@@ -31,7 +31,7 @@ export async function shareClip(clip: Clip, location: Location) {
     throw new Error("服务未生成链接，请缩短片段后重试");
   }
   const url = new URL(location.href);
-  url.hash = "replay=" + id + "," + key;
+  url.hash = `replay=${id},${key}`;
   return url.href;
 }
 

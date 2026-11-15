@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { exportScene } from "@excalidraw/excalidraw";
+
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
+
 import { dataUrl, frameAt, loadClip, shareClip } from "./storage";
+
 import type { Clip, Frame, Snapshot } from "./storage";
+
 import "./replay.css";
 
 export function RecordEntry({ api }: { api: ExcalidrawImperativeAPI }) {
@@ -182,7 +186,7 @@ function Studio({
     } catch (e) {
       stream?.getTracks().forEach((t) => t.stop());
       if (mounted.current) {
-        setError("无法开始录音：" + String(e));
+        setError(`无法开始录音：${String(e)}`);
         setPhase("idle");
       }
     }

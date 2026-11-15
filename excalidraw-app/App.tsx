@@ -1,4 +1,3 @@
-import { RecordEntry, ReplayLink } from "./replay/Replay";
 import {
   Excalidraw,
   LiveCollaborationTrigger,
@@ -79,6 +78,8 @@ import type {
 } from "@excalidraw/excalidraw/types";
 import type { ResolutionType } from "@excalidraw/common/utility-types";
 import type { ResolvablePromise } from "@excalidraw/common/utils";
+
+import { RecordEntry, ReplayLink } from "./replay/Replay";
 
 import CustomStats from "./CustomStats";
 import {

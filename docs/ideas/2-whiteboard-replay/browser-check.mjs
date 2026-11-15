@@ -32,27 +32,13 @@ try {
   await page.mouse.move(620, 260);
   await page.waitForTimeout(1300);
   await page.getByText("结束录制").click();
-  let encrypted;
-  await page.route("**/api/v2/post/", async (route) => {
-    encrypted = route.request().postDataBuffer();
-    await route.fulfill({
-      json: { id: "testclip" },
-      headers: { "Access-Control-Allow-Origin": "*" },
-    });
-  });
   await page.getByText("生成试用链接").click();
   const link = page.getByLabel("试用链接", { exact: true });
   await link.waitFor();
   const url = await link.inputValue();
-  assert.ok(encrypted?.length);
+  assert.ok(url.includes("#replay="));
   const reader = await browser.newContext();
   const tab = await reader.newPage();
-  await tab.route("**/api/v2/testclip", (route) =>
-    route.fulfill({
-      body: encrypted,
-      headers: { "Access-Control-Allow-Origin": "*" },
-    }),
-  );
   await tab.goto(url);
   const scene = tab.locator("svg[aria-label='评审定稿']");
   await scene.waitFor();

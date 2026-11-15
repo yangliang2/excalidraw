@@ -19,10 +19,15 @@ export async function shareClip(clip: Clip, location: Location) {
     new TextEncoder().encode(JSON.stringify(clip)),
     { encryptionKey: key },
   );
-  const response = await fetch(import.meta.env.VITE_APP_BACKEND_V2_POST_URL, {
-    method: "POST",
-    body: payload.buffer,
-  });
+  const response = await fetch(
+    import.meta.env.DEV
+      ? "/__replay/"
+      : import.meta.env.VITE_APP_BACKEND_V2_POST_URL,
+    {
+      method: "POST",
+      body: payload.buffer,
+    },
+  );
   if (!response.ok) {
     throw new Error("上传失败，请重试或缩短片段");
   }
@@ -41,7 +46,9 @@ export async function loadClip(hash: string): Promise<Clip> {
     throw new Error("无效的讲解链接");
   }
   const response = await fetch(
-    import.meta.env.VITE_APP_BACKEND_V2_GET_URL + match[1],
+    (import.meta.env.DEV
+      ? "/__replay/"
+      : import.meta.env.VITE_APP_BACKEND_V2_GET_URL) + match[1],
   );
   if (!response.ok) {
     throw new Error("无法读取讲解");

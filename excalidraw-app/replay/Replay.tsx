@@ -5,9 +5,9 @@ import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 
 import { dataUrl, frameAt, loadClip, shareClip } from "./storage";
 
-import type { Clip, Frame, Snapshot } from "./storage";
-
 import "./replay.css";
+
+import type { Clip, Frame, Snapshot } from "./storage";
 
 export function RecordEntry({ api }: { api: ExcalidrawImperativeAPI }) {
   const [snapshot, setSnapshot] = useState<Snapshot>();

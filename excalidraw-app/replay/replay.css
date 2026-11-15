@@ -1,6 +1,44 @@
-.replay-entry {position:absolute;right:16px;bottom:48px;z-index:5;display:grid;gap:4px}
-.replay-entry button,.replay-studio button {padding:8px 14px;border:1px solid #bbb;border-radius:8px;background:white;color:#282538;cursor:pointer}
-.replay-studio {position:fixed;inset:0;z-index:20;display:grid;grid-template-rows:auto minmax(0,1fr) auto;background:#f6f5f2;color:#242133;font:16px system-ui}
-.replay-studio header,.replay-studio footer {display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:12px 20px;background:white}
-.replay-studio header {justify-content:space-between}
-.replay-studio svg {width:100%;height:100%;touch-action:none}
+.replay-entry {
+  position: absolute;
+  right: 16px;
+  bottom: 48px;
+  z-index: 5;
+  display: grid;
+  gap: 4px;
+}
+.replay-entry button,
+.replay-studio button {
+  padding: 8px 14px;
+  border: 1px solid #bbb;
+  border-radius: 8px;
+  background: white;
+  color: #282538;
+  cursor: pointer;
+}
+.replay-studio {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: #f6f5f2;
+  color: #242133;
+  font: 16px system-ui;
+}
+.replay-studio header,
+.replay-studio footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 12px 20px;
+  background: white;
+}
+.replay-studio header {
+  justify-content: space-between;
+}
+.replay-studio svg {
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}

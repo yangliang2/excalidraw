@@ -1,4 +1,5 @@
 import path from "path";
+import { localReplayStore } from "./replay/trial-store.mjs";
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import svgrPlugin from "vite-plugin-svgr";
@@ -271,6 +272,7 @@ export default defineConfig(({ mode }) => {
       assetsInlineLimit: 0,
     },
     plugins: [
+      localReplayStore(),
       Sitemap({
         hostname: "https://excalidraw.com",
         outDir: "build",

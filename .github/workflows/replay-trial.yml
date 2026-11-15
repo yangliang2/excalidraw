@@ -1,0 +1,31 @@
+name: Whiteboard replay browser check
+on:
+  pull_request:
+    paths:
+      - excalidraw-app/replay/**
+      - excalidraw-app/App.tsx
+      - docs/ideas/2-whiteboard-replay/browser-check.mjs
+      - .github/workflows/replay-trial.yml
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: yarn install --frozen-lockfile
+      - run: yarn playwright install --with-deps chromium
+      - name: Check recording and playback in separate browser contexts
+        run: |
+          (cd excalidraw-app && BROWSER=none ../node_modules/.bin/vite --port 5173 --strictPort) > /tmp/replay-vite.log 2>&1 &
+          for attempt in {1..60}; do
+            if curl --fail --silent http://localhost:5173 > /dev/null; then break; fi
+            sleep 1
+          done
+          node docs/ideas/2-whiteboard-replay/browser-check.mjs

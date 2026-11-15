@@ -62,7 +62,7 @@ export async function loadClip(hash: string): Promise<Clip> {
       id === "order-example" &&
       import.meta.env.VITE_REPLAY_STATIC_PREVIEW === "true";
     const endpoint = sample
-      ? import.meta.env.BASE_URL + "order-example.bin"
+      ? `${import.meta.env.BASE_URL}order-example.bin`
       : (import.meta.env.DEV
           ? "/__replay/"
           : import.meta.env.VITE_APP_BACKEND_V2_GET_URL) + id;

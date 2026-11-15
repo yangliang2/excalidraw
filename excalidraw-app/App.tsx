@@ -1,3 +1,4 @@
+import { RecordEntry, ReplayLink } from "./replay/Replay";
 import {
   Excalidraw,
   LiveCollaborationTrigger,
@@ -953,6 +954,7 @@ const ExcalidrawWrapper = () => {
         "is-collaborating": isCollaborating,
       })}
     >
+      {excalidrawAPI && <RecordEntry api={excalidrawAPI} />}
       <Excalidraw
         viewportStatusFrame={viewportStatusFrame}
         userToFollow={userToFollow}
@@ -1311,6 +1313,9 @@ const ExcalidrawWrapper = () => {
 };
 
 const ExcalidrawApp = () => {
+  if (window.location.hash.startsWith("#replay=")) {
+    return <ReplayLink hash={window.location.hash} />;
+  }
   const isCloudExportWindow =
     window.location.pathname === "/excalidraw-plus-export";
   if (isCloudExportWindow) {

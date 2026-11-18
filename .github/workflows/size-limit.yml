@@ -1,28 +1,31 @@
 name: "Bundle Size check @excalidraw/excalidraw"
 on:
   pull_request:
-    branches:
-      - master
+    branches: [master]
+
+permissions:
+  contents: read
+
 jobs:
   size:
-    runs-on: ubuntu-latest
-    env:
-      CI_JOB_NUMBER: 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          node-version: 20.x
-      - name: Install in packages/excalidraw
-        run: yarn
-        working-directory: packages/excalidraw
-        env:
-          CI: true
-      - uses: andresz1/size-limit-action@e7493a72a44b113341c0cf6186ab49c17c4b65c1 # v1
+          path: candidate
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          build_script: build:esm
-          skip_step: install
-          directory: packages/excalidraw
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Build baseline and candidate package assets
+        run: |
+          for tree in baseline candidate; do
+            (cd "$tree" && yarn install --frozen-lockfile)
+            (cd "$tree/packages/excalidraw" && node ../../scripts/buildPackage.js)
+          done
+      - name: Compare gzip sizes against budgets and existing baseline excess
+        run: node candidate/scripts/check-package-size.mjs baseline/packages/excalidraw/dist/prod candidate/packages/excalidraw/dist/prod >> "$GITHUB_STEP_SUMMARY"

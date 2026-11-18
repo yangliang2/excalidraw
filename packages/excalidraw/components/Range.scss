@@ -13,13 +13,19 @@
   }
 
   .range-input {
+    --range-direction: to right;
+
+    &:dir(rtl) {
+      --range-direction: to left;
+    }
+
     width: 100%;
     // UA default margin would offset the track from the value bubble
     margin-inline: 0;
     height: 4px;
     -webkit-appearance: none;
     background: linear-gradient(
-      to right,
+      var(--range-direction),
       var(--color-slider-track) calc(var(--range-progress) * 100%),
       var(--button-bg) calc(var(--range-progress) * 100%)
     );
@@ -51,11 +57,16 @@
     position: absolute;
     bottom: 0;
     // centered on the thumb, which travels (width - thumb size)
-    left: calc(
+    inset-inline-start: calc(
       var(--slider-thumb-size) / 2 + (100% - var(--slider-thumb-size)) *
         var(--range-progress)
     );
     transform: translateX(-50%);
+
+    &:dir(rtl) {
+      transform: translateX(50%);
+    }
+
     font-size: 12px;
     color: var(--text-primary-color);
   }
@@ -63,7 +74,7 @@
   .zero-label {
     position: absolute;
     bottom: 0;
-    left: 4px;
+    inset-inline-start: 4px;
     font-size: 12px;
     color: var(--text-primary-color);
   }

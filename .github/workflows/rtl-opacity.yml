@@ -1,0 +1,40 @@
+name: RTL opacity browser check
+on:
+  pull_request:
+    paths:
+      - packages/excalidraw/components/Range.*
+      - packages/excalidraw/actions/actionProperties.tsx
+      - scripts/browser/rtl-opacity.mjs
+      - .github/workflows/rtl-opacity.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rtl-opacity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn playwright install --with-deps chromium
+      - name: Verify opacity labels, fill, keyboard and pointer in LTR and RTL
+        run: |
+          (cd excalidraw-app && BROWSER=none VITE_APP_ENABLE_ESLINT=false ../node_modules/.bin/vite --host 127.0.0.1 --port 5173 --strictPort) > /tmp/rtl-vite.log 2>&1 &
+          trap 'kill $! 2>/dev/null || true' EXIT
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:5173 > /dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/browser/rtl-opacity.mjs
+      - name: Vite diagnostics
+        if: failure()
+        run: cat /tmp/rtl-vite.log

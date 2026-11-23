@@ -4,7 +4,7 @@ on:
     paths:
       - packages/excalidraw/components/Range.*
       - packages/excalidraw/actions/actionProperties.tsx
-      - scripts/browser/rtl-opacity.mjs
+      - scripts/browser/**
       - .github/workflows/rtl-opacity.yml
 
 permissions:
@@ -26,15 +26,13 @@ jobs:
           cache: yarn
       - run: yarn install --frozen-lockfile
       - run: yarn playwright install --with-deps chromium
-      - name: Verify opacity labels, fill, keyboard and pointer in LTR and RTL
-        run: |
-          (cd excalidraw-app && BROWSER=none VITE_APP_ENABLE_ESLINT=false ../node_modules/.bin/vite --host 127.0.0.1 --port 5173 --strictPort) > /tmp/rtl-vite.log 2>&1 &
-          trap 'kill $! 2>/dev/null || true' EXIT
-          for attempt in {1..60}; do
-            if curl --fail --silent http://127.0.0.1:5173 > /dev/null; then break; fi
-            sleep 1
-          done
-          node scripts/browser/rtl-opacity.mjs
-      - name: Vite diagnostics
-        if: failure()
-        run: cat /tmp/rtl-vite.log
+      - name: Verify production opacity, scene data, undo/redo and reload
+        run: python3 scripts/browser/check-rtl-production.py
+      - name: Retain production browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rtl-opacity-production
+          path: test-results/rtl-opacity/
+          retention-days: 14
+          if-no-files-found: error

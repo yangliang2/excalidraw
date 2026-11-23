@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { chromium } from "playwright";
 
 const output = process.env.ARTIFACT_DIR || "test-results/rtl-opacity";
@@ -11,6 +11,7 @@ const browser = await chromium.launch({
 });
 const failures = [];
 let checks = 0;
+let sceneChecks = 0;
 try {
   for (const width of [1200, 800]) {
     for (const lang of ["en", "ar", "he"]) {
@@ -35,9 +36,43 @@ try {
           .locator(".compact-action-button.properties-trigger")
           .first()
           .click();
+      let rectangleId;
+      const sceneOpacity = async (value) => {
+        await page.waitForFunction(
+          ({ id, opacity }) => {
+            const elements = JSON.parse(
+              localStorage.getItem("excalidraw") || "[]",
+            );
+            const rectangle = elements.find(
+              (element) =>
+                element.type === "rectangle" &&
+                !element.isDeleted &&
+                (!id || element.id === id),
+            );
+            return rectangle && rectangle.opacity === opacity;
+          },
+          { id: rectangleId, opacity: value },
+          { timeout: 10000 },
+        );
+        if (!rectangleId)
+          rectangleId = await page.evaluate(
+            () =>
+              JSON.parse(localStorage.getItem("excalidraw")).find(
+                (element) => element.type === "rectangle" && !element.isDeleted,
+              ).id,
+          );
+        sceneChecks++;
+      };
+      await sceneOpacity(100);
       const input = page.getByTestId("opacity");
       await input.waitFor();
       const verify = async (value, label) => {
+        if (width < 1181 && !(await input.isVisible())) {
+          await page
+            .locator(".compact-action-button.properties-trigger")
+            .first()
+            .click();
+        }
         const actual = await input.evaluate((element) => {
           const win = element.ownerDocument.defaultView;
           const wrapper = element.parentElement;
@@ -96,6 +131,7 @@ try {
               "minimum should not have a duplicate label",
             );
           }
+          await sceneOpacity(value);
           checks++;
         } catch (error) {
           failures.push(`${lang}/${width}/${label}: ${error.message}`);
@@ -122,12 +158,45 @@ try {
       await input.focus();
       await page.keyboard.press(lang === "en" ? "ArrowRight" : "ArrowLeft");
       await verify(40, "directional-key");
+      // Move focus off the range so native input undo cannot mask editor history.
+      await input.evaluate((element) => element.blur());
+      await page.getByTestId("button-undo").click();
+      await verify(30, "undo");
+      await page.getByTestId("button-redo").click();
+      await verify(40, "redo");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator("canvas").first().waitFor();
+      await page.getByTestId("toolbar-selection").click();
+      await page.mouse.click(width - 170, 500);
+      await page.keyboard.press("ControlOrMeta+a");
+      if (width < 1181)
+        await page
+          .locator(".compact-action-button.properties-trigger")
+          .first()
+          .click();
+      await input.waitFor();
+      await verify(40, "reload");
       await context.close();
     }
   }
 } finally {
   await browser.close();
 }
-console.log(`${checks} passed; ${failures.length} failed`);
+await writeFile(
+  `${output}/result.json`,
+  JSON.stringify(
+    {
+      checks,
+      sceneChecks,
+      failures,
+      baseURL: process.env.BASE_URL || "http://127.0.0.1:5173",
+    },
+    null,
+    2,
+  ),
+);
+console.log(
+  `${checks} passed; ${sceneChecks} persisted scene assertions; ${failures.length} failed`,
+);
 for (const failure of failures) console.error(failure);
 assert.equal(failures.length, 0, "RTL opacity browser regression");

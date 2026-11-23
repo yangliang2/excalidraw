@@ -4,13 +4,18 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 
 function measure(root) {
-  const files = readdirSync(root, { recursive: true }).filter((p) =>
-    p.endsWith(".js"),
+  const files = readdirSync(root, { recursive: true }).filter(
+    (p) => p.endsWith(".js") || p.endsWith(".css"),
   );
   const groups = [
     ["入口", (p) => p === "index.js", 340000],
-    ["语言包", (p) => p.startsWith("locales/"), 290000],
-    ["分块", (p) => p !== "index.js" && !p.startsWith("locales/"), 900000],
+    ["语言包", (p) => p.endsWith(".js") && p.startsWith("locales/"), 290000],
+    [
+      "分块",
+      (p) => p.endsWith(".js") && p !== "index.js" && !p.startsWith("locales/"),
+      900000,
+    ],
+    ["样式", (p) => p.endsWith(".css"), null],
   ];
   return groups.map(([name, matches, limit]) => {
     const paths = files.filter(matches);
@@ -31,8 +36,14 @@ for (const [index, group] of head.entries()) {
     base: baseline,
     head: group.bytes,
     budget: group.limit,
+    delta: group.bytes - baseline,
+    ...(group.limit === null ? { growthTolerance: 1024 } : {}),
   });
-  if (group.bytes > group.limit && group.bytes > baseline) {
+  if (
+    group.limit === null
+      ? group.bytes > baseline + 1024
+      : group.bytes > group.limit && group.bytes > baseline
+  ) {
     process.exitCode = 1;
   }
 }

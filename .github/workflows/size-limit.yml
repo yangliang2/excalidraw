@@ -21,6 +21,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
+      - name: Verify size gate rejects missing or oversized CSS
+        run: node --test scripts/check-package-size-smoke.mjs
+        working-directory: candidate
       - name: Build baseline and candidate package assets
         run: |
           for tree in baseline candidate; do

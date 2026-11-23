@@ -15,7 +15,7 @@
   .range-input {
     --range-direction: to right;
 
-    &:dir(rtl) {
+    :root[dir="rtl"] & {
       --range-direction: to left;
     }
 
@@ -63,7 +63,7 @@
     );
     transform: translateX(-50%);
 
-    &:dir(rtl) {
+    :root[dir="rtl"] & {
       transform: translateX(50%);
     }
 

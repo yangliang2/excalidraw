@@ -2,6 +2,7 @@
 """Prepare the real PR14 verification/handoff plan after implementation is committed."""
 import argparse
 import json
+import shutil
 from pathlib import Path
 import sys
 
@@ -13,6 +14,11 @@ folder = args.run_directory.resolve()
 if folder.is_relative_to(repo) or repo.is_relative_to(folder):
     parser.error('run_directory must be outside the repository')
 folder.mkdir(parents=True, exist_ok=True)
+with (folder/'agent-policy.json').open('x') as f:
+    json.dump({'codex_attempts':2,'backoff_seconds':2,'attempt_timeout':900,'total_timeout':2400,
+               'codex':shutil.which('codex'),'claude':shutil.which('claude')},f,indent=2)
+with (folder/'agent-instructions.md').open('x') as f:
+    f.write('Read-only independent review against both fixed specs and real runner evidence. Verify actual behavior and review sufficiency; no product approval. Report only actionable blockers; pass has empty findings.')
 ac = ['AC-RTL', 'AC-SCENE', 'AC-CI', 'AC-HANDOFF']
 def command(path):
     return [sys.executable, str(repo / path)]

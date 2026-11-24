@@ -1,0 +1,19 @@
+name: Local Agent recovery contract
+on:
+  pull_request:
+    paths:
+      - scripts/workflow/**
+      - .github/workflows/agent-recovery.yml
+permissions:
+  contents: read
+concurrency:
+  group: agent-recovery-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  agent-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Verify recovery, no-replay, cancellation and evidence boundaries
+        run: python3 -m unittest discover -s scripts/workflow/tests -v

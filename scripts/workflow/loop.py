@@ -128,8 +128,10 @@ def invalidate(p, state):
 
 
 def receipt_valid(r, folder):
-    return all((folder / r[k]).is_file() and sha((folder / r[k]).read_bytes()) == r[k + '_sha256']
-               for k in ('stdout', 'stderr'))
+    return (all((folder / name).is_file() and sha((folder / name).read_bytes()) == expected
+                for name, expected in r.get('attachments', {}).items())
+            and all((folder / r[k]).is_file() and sha((folder / r[k]).read_bytes()) == r[k + '_sha256']
+               for k in ('stdout', 'stderr')))
 
 
 def finish(p, state, folder):
@@ -265,8 +267,16 @@ def worker(request_path, lock_fd):
             try:
                 result['returncode'] = child.wait(timeout=req['step'].get('timeout', 300))
             except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
+                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 result.update(returncode=124, timeout=True)
     except OSError as exc:
         result.update(returncode=127, launch_error=str(exc))
@@ -276,6 +286,9 @@ def worker(request_path, lock_fd):
             path.touch()
         result[name] = str(path.relative_to(folder.parent.parent))
         result[name + '_sha256'] = sha(path.read_bytes())
+    result['attachments'] = {str(p.relative_to(folder.parent.parent)): sha(p.read_bytes())
+                             for p in (folder/'agents').rglob('*') if p.is_file()
+                             and p.resolve().is_relative_to(folder.resolve())}
     result['finished_at'] = time.time()
     save(folder/'result.json', result)
     os.close(lock_fd)

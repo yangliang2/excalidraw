@@ -1,0 +1,39 @@
+name: Empty text history acceptance
+on:
+  pull_request:
+    paths:
+      - packages/excalidraw/components/App.text.ts
+      - packages/excalidraw/wysiwyg/**
+      - packages/excalidraw/tests/emptyTextHistory.test.tsx
+      - scripts/browser/**
+      - .github/workflows/empty-text-history.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: empty-text-history-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  empty-text-history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn playwright install --with-deps chromium
+      - name: Verify production empty text history
+        run: python3 scripts/browser/check-empty-text-production.py
+      - name: Retain production browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: empty-text-history-production
+          path: test-results/empty-text-history/
+          retention-days: 14
+          if-no-files-found: error

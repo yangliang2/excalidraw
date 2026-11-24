@@ -1,5 +1,7 @@
 import { pointFrom } from "@excalidraw/math";
+
 import { Excalidraw } from "../index";
+
 import { API } from "./helpers/api";
 import { Keyboard, Pointer } from "./helpers/ui";
 import { getTextEditor } from "./queries/dom";
@@ -33,7 +35,9 @@ it("keeps a connected arrow identical on empty resize submission and repeated re
   );
   const endY = () => {
     const current = h.elements.find((el) => el.id === arrow.id)!;
-    if (current.type !== "arrow") throw new Error("missing arrow");
+    if (current.type !== "arrow") {
+      throw new Error("missing arrow");
+    }
     return current.y + current.points[current.points.length - 1][1];
   };
   const before = endY();

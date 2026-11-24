@@ -184,6 +184,7 @@ import {
   getSelectedGroupIdForElement,
   getSelectedGroupIds,
   syncInvalidIndices,
+  syncInvalidIndicesImmutable,
   excludeElementsInFramesFromSelection,
   makeNextSelectedElementIds,
   getCursorForResizingElement,
@@ -785,7 +786,10 @@ class App extends React.Component<AppProps, AppState> {
   /** offsets of `elementRenderOverrides`; keeps its identity while they don't change */
   private elementRenderOffsets: ElementRenderOffsets = new Map();
   private renderOverridesUpdatePending = false;
-  private appStateOnlyCaptureKeys = new Set<keyof ObservedAppState>();
+  private appStateOnlyCapture: {
+    baseline: ObservedAppState;
+    updates: Partial<Pick<AppState, keyof ObservedAppState>>;
+  } | null = null;
 
   private getRenderOverrideConfig = () => ({
     elementRenderOverrides: this.elementRenderOverrides,
@@ -902,7 +906,7 @@ class App extends React.Component<AppProps, AppState> {
     this.library = new Library(this);
     this.actionManager = new ActionManager(
       this.syncActionResult,
-      () => this.state,
+      this.getActionAppState,
       () => this.scene.getElementsIncludingDeleted(),
       this,
     );
@@ -3150,6 +3154,62 @@ class App extends React.Component<AppProps, AppState> {
     });
   };
 
+  // Action results often spread their input state. Give them the queued values
+  // so a same-batch edit can explicitly restore an earlier value.
+  private getActionAppState = (): AppState =>
+    this.appStateOnlyCapture
+      ? { ...this.state, ...this.appStateOnlyCapture.updates }
+      : this.state;
+
+  private queueDraftAppStateUpdate(
+    action:
+      | typeof CaptureUpdateAction.IMMEDIATELY
+      | typeof CaptureUpdateAction.NEVER,
+    appState: Partial<AppState>,
+    elements?: SceneData["elements"],
+  ) {
+    const state = { ...this.getActionAppState(), ...appState };
+    const observed = getObservedAppState(state);
+    const keys = (Object.keys(observed) as (keyof ObservedAppState)[]).filter(
+      (key) => Object.prototype.hasOwnProperty.call(appState, key),
+    );
+    if (!keys.length && !elements) {
+      return;
+    }
+
+    const baseline =
+      this.appStateOnlyCapture?.baseline ?? getObservedAppState(this.state);
+    const updates = { ...this.appStateOnlyCapture?.updates };
+    const nextBaseline = { ...baseline };
+    for (const key of keys) {
+      Object.assign(updates, { [key]: state[key] });
+      Object.assign(nextBaseline, { [key]: observed[key] });
+    }
+
+    // NEVER advances the baseline for the fields it writes, cancelling any
+    // earlier local edit to those fields in this batch.
+    if (action === CaptureUpdateAction.NEVER) {
+      const previous = StoreSnapshot.create(
+        this.scene.getElementsMapIncludingDeleted(),
+        baseline,
+      );
+      const next = previous.maybeClone(
+        action,
+        elements ? syncInvalidIndicesImmutable(elements) : undefined,
+        nextBaseline,
+      );
+      if (next !== previous) {
+        this.store.scheduleMicroAction({
+          action,
+          change: StoreChange.create(previous, next),
+        });
+      }
+      this.appStateOnlyCapture = { baseline: nextBaseline, updates };
+    } else {
+      this.appStateOnlyCapture = { baseline, updates };
+    }
+  }
+
   public syncActionResult = withBatchedUpdates((actionResult: ActionResult) => {
     if (this.unmounted || actionResult === false) {
       return;
@@ -3195,29 +3255,23 @@ class App extends React.Component<AppProps, AppState> {
     ) {
       // Capture app state changes such as canvas background independently of
       // the draft label and its container resize.
-      if (actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY) {
-        const current = getObservedAppState(this.state);
-        const next = getObservedAppState({ ...this.state, ...actionAppState });
-        const changedKeys = new Set(Delta.getRightDifferences(current, next));
-        actionAppState = { ...actionAppState };
-        for (const key of Object.keys(current) as (keyof ObservedAppState)[]) {
-          if (changedKeys.has(key)) {
-            this.appStateOnlyCaptureKeys.add(key);
-          } else if (!this.appStateOnlyCaptureKeys.has(key)) {
-            // Actions often return a copy of the state they were given. Let
-            // unrelated fields keep their value from earlier queued updates.
-            delete actionAppState[key];
-          }
+      const state = this.getActionAppState();
+      const current = getObservedAppState(state);
+      const next = getObservedAppState({
+        ...state,
+        ...actionAppState,
+        name: actionAppState.name ?? state.name,
+      });
+      const changedKeys = new Set(Delta.getRightDifferences(current, next));
+      actionAppState = { ...actionAppState };
+      for (const key of Object.keys(current) as (keyof ObservedAppState)[]) {
+        if (!changedKeys.has(key)) {
+          // Actions often return a copy of the state they were given. Keep
+          // those fields out of both the React update and the history capture.
+          delete actionAppState[key];
         }
-      } else {
-        this.store.scheduleMicroAction({
-          action: actionResult.captureUpdate,
-          elements: undefined,
-          appState: actionResult.appState
-            ? { ...this.state, ...actionResult.appState }
-            : undefined,
-        });
       }
+      this.queueDraftAppStateUpdate(actionResult.captureUpdate, actionAppState);
     } else {
       // Leave property edits (including font preview resets) in the draft so
       // submit can capture the shape resize with the final label or its cleanup.
@@ -4386,6 +4440,9 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
+    const appStateOnlyCapture = this.appStateOnlyCapture;
+    this.appStateOnlyCapture = null;
+
     // must be updated *before* state change listeners are triggered below
     if (!this._initialized && !this.state.isLoading) {
       this._initialized = true;
@@ -4579,21 +4636,17 @@ class App extends React.Component<AppProps, AppState> {
       this.setState({ scrolledOutside });
     }
 
-    if (this.appStateOnlyCaptureKeys.size) {
-      // Use the committed values for fields owned by these actions so updates
-      // in the same batch coalesce, including a change back to the old value.
+    if (appStateOnlyCapture) {
       const action = CaptureUpdateAction.IMMEDIATELY;
       const previous = StoreSnapshot.create(
         StoreSnapshot.empty().elements,
-        prevState,
+        appStateOnlyCapture.baseline,
       );
-      const committed = getObservedAppState(this.state);
-      const captured = { ...previous.appState };
-      for (const key of this.appStateOnlyCaptureKeys) {
-        Object.assign(captured, { [key]: committed[key] });
-      }
-      this.appStateOnlyCaptureKeys.clear();
-      const next = previous.maybeClone(action, undefined, captured);
+      // Coalesce the queued local changes from their latest per-field baseline.
+      const next = previous.maybeClone(action, undefined, {
+        ...previous.appState,
+        ...appStateOnlyCapture.updates,
+      });
       if (next !== previous) {
         this.store.scheduleMicroAction({
           action,
@@ -5154,14 +5207,16 @@ class App extends React.Component<AppProps, AppState> {
     }) => {
       const { elements, appState, collaborators, captureUpdate } = sceneData;
 
-      if (captureUpdate) {
-        if (captureUpdate === CaptureUpdateAction.NEVER && appState) {
-          for (const key of this.appStateOnlyCaptureKeys) {
-            if (Object.prototype.hasOwnProperty.call(appState, key)) {
-              this.appStateOnlyCaptureKeys.delete(key);
-            }
-          }
-        }
+      const editingText = this.state.editingTextElement;
+      const isEditingNewShapeLabel =
+        editingText && this.text.isEditingNewShapeLabel(editingText.id);
+      if (
+        captureUpdate === CaptureUpdateAction.NEVER &&
+        appState &&
+        (this.appStateOnlyCapture || isEditingNewShapeLabel)
+      ) {
+        this.queueDraftAppStateUpdate(captureUpdate, appState, elements);
+      } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;
         const observedAppState = appState
           ? getObservedAppState({

@@ -195,6 +195,7 @@ import {
   StoreChange,
   StoreSnapshot,
   CaptureUpdateAction,
+  type CaptureUpdateActionType,
   type ElementUpdate,
   hitElementBoundingBox,
   isLineElement,
@@ -475,6 +476,20 @@ import type {
 } from "../types";
 import type { RoughCanvas } from "roughjs/bin/canvas";
 import type { Action, ActionResult } from "../actions/types";
+
+type DraftSceneUpdate = {
+  action: CaptureUpdateActionType;
+  change: StoreChange;
+  previousAppState?: ObservedAppState;
+};
+
+type DraftSceneCapture = {
+  initialAppState: ObservedAppState;
+  updates: Partial<Pick<AppState, keyof ObservedAppState>>;
+  queue: DraftSceneUpdate[];
+  pendingFields: Map<keyof ObservedAppState, DraftSceneUpdate>;
+  latestNever: Map<keyof ObservedAppState, number>;
+};
 
 const isUIConfig = (ui: AppProps["ui"]): ui is UIConfig =>
   typeof ui === "object" && ui !== null;
@@ -786,10 +801,7 @@ class App extends React.Component<AppProps, AppState> {
   /** offsets of `elementRenderOverrides`; keeps its identity while they don't change */
   private elementRenderOffsets: ElementRenderOffsets = new Map();
   private renderOverridesUpdatePending = false;
-  private appStateOnlyCapture: {
-    baseline: ObservedAppState;
-    updates: Partial<Pick<AppState, keyof ObservedAppState>>;
-  } | null = null;
+  private draftSceneCapture: DraftSceneCapture | null = null;
 
   private getRenderOverrideConfig = () => ({
     elementRenderOverrides: this.elementRenderOverrides,
@@ -3157,56 +3169,147 @@ class App extends React.Component<AppProps, AppState> {
   // Action results often spread their input state. Give them the queued values
   // so a same-batch edit can explicitly restore an earlier value.
   private getActionAppState = (): AppState =>
-    this.appStateOnlyCapture
-      ? { ...this.state, ...this.appStateOnlyCapture.updates }
+    this.draftSceneCapture
+      ? { ...this.state, ...this.draftSceneCapture.updates }
       : this.state;
 
-  private queueDraftAppStateUpdate(
-    action:
-      | typeof CaptureUpdateAction.IMMEDIATELY
-      | typeof CaptureUpdateAction.NEVER,
+  private queueDraftSceneUpdate(
     appState: Partial<AppState>,
+    action?: CaptureUpdateActionType,
     elements?: SceneData["elements"],
   ) {
-    const state = { ...this.getActionAppState(), ...appState };
+    const current = this.getActionAppState();
+    const state = { ...current, ...appState };
     const observed = getObservedAppState(state);
     const keys = (Object.keys(observed) as (keyof ObservedAppState)[]).filter(
       (key) => Object.prototype.hasOwnProperty.call(appState, key),
     );
-    if (!keys.length && !elements) {
+    if (!keys.length && !(action && elements)) {
       return;
     }
 
-    const baseline =
-      this.appStateOnlyCapture?.baseline ?? getObservedAppState(this.state);
-    const updates = { ...this.appStateOnlyCapture?.updates };
-    const nextBaseline = { ...baseline };
+    const capture: DraftSceneCapture = (this.draftSceneCapture ??= {
+      initialAppState: getObservedAppState(this.state),
+      updates: {},
+      queue: [],
+      pendingFields: new Map(),
+      latestNever: new Map(),
+    });
     for (const key of keys) {
-      Object.assign(updates, { [key]: state[key] });
-      Object.assign(nextBaseline, { [key]: observed[key] });
+      Object.assign(capture.updates, { [key]: state[key] });
+    }
+    if (!action) {
+      return;
     }
 
-    // NEVER advances the baseline for the fields it writes, cancelling any
-    // earlier local edit to those fields in this batch.
-    if (action === CaptureUpdateAction.NEVER) {
+    let change: StoreChange = { elements: {}, appState: {} };
+    if (elements) {
+      // Compute the element change against the live scene at the time of the
+      // call. The scene can still contain the unsaved label and resize.
       const previous = StoreSnapshot.create(
         this.scene.getElementsMapIncludingDeleted(),
-        baseline,
+        capture.initialAppState,
       );
       const next = previous.maybeClone(
         action,
-        elements ? syncInvalidIndicesImmutable(elements) : undefined,
-        nextBaseline,
+        syncInvalidIndicesImmutable(elements),
+        undefined,
       );
-      if (next !== previous) {
+      change = StoreChange.create(previous, next);
+    }
+
+    const last = capture.queue.at(-1);
+    const hasElements = !!Object.keys(change.elements).length;
+    const update: DraftSceneUpdate =
+      !hasElements &&
+      action === CaptureUpdateAction.IMMEDIATELY &&
+      last?.action === action &&
+      !Object.keys(last.change.elements).length
+        ? last
+        : { action, change };
+
+    if (action === CaptureUpdateAction.EVENTUALLY) {
+      update.previousAppState = getObservedAppState(current);
+    }
+
+    for (const key of keys) {
+      if (action === CaptureUpdateAction.IMMEDIATELY) {
+        // Coalesce pending state edits. A capture with element changes closes
+        // the pending edit for the fields it commits with those elements.
+        const pending = capture.pendingFields.get(key);
+        if (pending) {
+          delete pending.change.appState[key];
+        }
+        if (hasElements) {
+          capture.pendingFields.delete(key);
+        } else {
+          capture.pendingFields.set(key, update);
+        }
+      } else if (action === CaptureUpdateAction.NEVER) {
+        capture.pendingFields.delete(key);
+        capture.latestNever.set(key, capture.queue.length);
+      }
+      Object.assign(update.change.appState, { [key]: observed[key] });
+    }
+
+    if (update !== last) {
+      capture.queue.push(update);
+    }
+  }
+
+  private scheduleDraftSceneUpdates(capture: DraftSceneCapture) {
+    const emptyElements = StoreSnapshot.empty().elements;
+    let capturedElements = this.store.snapshot.elements;
+    let capturedAppState = capture.initialAppState;
+    for (const [index, update] of capture.queue.entries()) {
+      const { action, change, previousAppState } = update;
+      if (action === CaptureUpdateAction.IMMEDIATELY) {
+        // A later NEVER write wins for the field, including when the earlier
+        // write was part of an element capture.
+        for (const [key, neverIndex] of capture.latestNever) {
+          if (index < neverIndex) {
+            delete change.appState[key];
+          }
+        }
+      }
+
+      const hasElements = !!Object.keys(change.elements).length;
+      const previous = StoreSnapshot.create(
+        hasElements ? capturedElements : emptyElements,
+        previousAppState ?? capturedAppState,
+      );
+      const next = hasElements
+        ? previous.applyChange(change)
+        : previous.maybeClone(action, undefined, {
+            ...previous.appState,
+            ...change.appState,
+          });
+      if (next === previous) {
+        continue;
+      }
+
+      const committedChange = {
+        elements: change.elements,
+        appState: next.getChangedAppState(previous),
+      };
+      if (action === CaptureUpdateAction.IMMEDIATELY) {
         this.store.scheduleMicroAction({
           action,
-          change: StoreChange.create(previous, next),
+          change: committedChange,
+          delta: StoreDelta.calculate(previous, next),
+        });
+      } else {
+        this.store.scheduleMicroAction({
+          action,
+          change: committedChange,
         });
       }
-      this.appStateOnlyCapture = { baseline: nextBaseline, updates };
-    } else {
-      this.appStateOnlyCapture = { baseline, updates };
+      if (action !== CaptureUpdateAction.EVENTUALLY) {
+        capturedAppState = next.appState;
+        if (hasElements) {
+          capturedElements = next.elements;
+        }
+      }
     }
   }
 
@@ -3248,13 +3351,13 @@ class App extends React.Component<AppProps, AppState> {
           : null;
     }
 
-    if (
-      isEditingNewShapeLabel &&
+    const captureDraftAppState =
+      isEditingNewShapeLabel || this.draftSceneCapture;
+    const captureAppStateSeparately =
+      captureDraftAppState &&
       !actionResult.elements &&
-      actionResult.captureUpdate !== CaptureUpdateAction.EVENTUALLY
-    ) {
-      // Capture app state changes such as canvas background independently of
-      // the draft label and its container resize.
+      actionResult.captureUpdate !== CaptureUpdateAction.EVENTUALLY;
+    if (captureDraftAppState && actionResult.appState) {
       const state = this.getActionAppState();
       const current = getObservedAppState(state);
       const next = getObservedAppState({
@@ -3271,8 +3374,12 @@ class App extends React.Component<AppProps, AppState> {
           delete actionAppState[key];
         }
       }
-      this.queueDraftAppStateUpdate(actionResult.captureUpdate, actionAppState);
-    } else {
+      this.queueDraftSceneUpdate(
+        actionAppState,
+        captureAppStateSeparately ? actionResult.captureUpdate : undefined,
+      );
+    }
+    if (!captureAppStateSeparately) {
       // Leave property edits (including font preview resets) in the draft so
       // submit can capture the shape resize with the final label or its cleanup.
       const deferCapture =
@@ -4440,8 +4547,11 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    const appStateOnlyCapture = this.appStateOnlyCapture;
-    this.appStateOnlyCapture = null;
+    const draftSceneCapture = this.draftSceneCapture;
+    this.draftSceneCapture = null;
+    if (draftSceneCapture?.queue.length) {
+      this.scheduleDraftSceneUpdates(draftSceneCapture);
+    }
 
     // must be updated *before* state change listeners are triggered below
     if (!this._initialized && !this.state.isLoading) {
@@ -4634,26 +4744,6 @@ class App extends React.Component<AppProps, AppState> {
         : !this.visibleElements.length && this.hasRenderableElements;
     if (this.state.scrolledOutside !== scrolledOutside) {
       this.setState({ scrolledOutside });
-    }
-
-    if (appStateOnlyCapture) {
-      const action = CaptureUpdateAction.IMMEDIATELY;
-      const previous = StoreSnapshot.create(
-        StoreSnapshot.empty().elements,
-        appStateOnlyCapture.baseline,
-      );
-      // Coalesce the queued local changes from their latest per-field baseline.
-      const next = previous.maybeClone(action, undefined, {
-        ...previous.appState,
-        ...appStateOnlyCapture.updates,
-      });
-      if (next !== previous) {
-        this.store.scheduleMicroAction({
-          action,
-          change: StoreChange.create(previous, next),
-          delta: StoreDelta.calculate(previous, next),
-        });
-      }
     }
 
     this.store.commit(elementsMap, this.state);
@@ -5210,14 +5300,8 @@ class App extends React.Component<AppProps, AppState> {
       const editingText = this.state.editingTextElement;
       const isEditingNewShapeLabel =
         editingText && this.text.isEditingNewShapeLabel(editingText.id);
-      if (
-        appState &&
-        (this.appStateOnlyCapture || isEditingNewShapeLabel) &&
-        (captureUpdate === CaptureUpdateAction.NEVER ||
-          (captureUpdate === CaptureUpdateAction.IMMEDIATELY && !elements))
-      ) {
-        // Coalesce app-state-only edits with canvas actions in call order.
-        this.queueDraftAppStateUpdate(captureUpdate, appState, elements);
+      if (this.draftSceneCapture || isEditingNewShapeLabel) {
+        this.queueDraftSceneUpdate(appState ?? {}, captureUpdate, elements);
       } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;
         const observedAppState = appState

@@ -19,8 +19,12 @@ const recordEnvironmentError = (error) => {
   console.error("Browser check environment error", error);
 };
 const saveScreenshot = async (page, filename) => {
-  const image = await page.screenshot();
-  await writeFile(`${output}/${filename}`, image).catch(recordEnvironmentError);
+  try {
+    const image = await page.screenshot();
+    await writeFile(`${output}/${filename}`, image);
+  } catch (error) {
+    recordEnvironmentError(error);
+  }
 };
 
 let checks = 0;
@@ -105,19 +109,15 @@ try {
         (!page || !browser.isConnected() || previewUnavailable)
       ) {
         recordEnvironmentError(error);
+        break;
       } else {
         failures.push({ type, error: String(error) });
         if (page) {
-          await saveScreenshot(page, `${type}-failure.png`).catch(
-            recordEnvironmentError,
-          );
+          await saveScreenshot(page, `${type}-failure.png`);
         }
       }
     } finally {
       await context?.close().catch(recordEnvironmentError);
-    }
-    if (environmentError) {
-      break;
     }
   }
 } finally {

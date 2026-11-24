@@ -84,6 +84,12 @@ export class AppText {
   constructor(private app: App, private dependencies: AppTextDependencies) {}
 
   public textWysiwygSubmitHandler: ReturnType<typeof textWysiwyg> | null = null;
+  private newShapeLabelId: string | null = null;
+
+  public isEditingNewShapeLabel(elementId: string) {
+    return this.newShapeLabelId === elementId;
+  }
+
   private getTextCreationGridPoint = (x: number, y: number) => {
     const effectiveGridSize = this.app.getEffectiveGridSize();
 
@@ -278,6 +284,18 @@ export class AppText {
       }
     };
 
+    const container = getContainerElement(
+      element,
+      this.app.scene.getNonDeletedElementsMap(),
+    );
+    this.newShapeLabelId =
+      !isExistingElement &&
+      container &&
+      !isArrowElement(container) &&
+      !isStickyNoteElement(container)
+        ? element.id
+        : null;
+
     this.textWysiwygSubmitHandler = textWysiwyg({
       canvas: this.app.canvas,
       getViewportCoords: (x, y) => {
@@ -303,6 +321,7 @@ export class AppText {
       }),
       onSubmit: withBatchedUpdates(({ viaKeyboard, nextOriginalText }) => {
         this.textWysiwygSubmitHandler = null;
+        this.newShapeLabelId = null;
 
         const isDeleted = !nextOriginalText.trim();
         updateElement(nextOriginalText, isDeleted);

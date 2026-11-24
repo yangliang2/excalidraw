@@ -49,7 +49,6 @@ import {
   getBoundTextElement,
   getBaseFontSize,
   getBaseFontSizeUpdate,
-  getContainerElement,
   redrawTextBoundingBox,
 } from "@excalidraw/element";
 
@@ -75,7 +74,6 @@ import {
   updateElbowArrowPoints,
   updateElbowArrowRoute,
   CaptureUpdateAction,
-  Store,
   toggleLinePolygonState,
 } from "@excalidraw/element";
 
@@ -348,18 +346,6 @@ const changeFontSize = (
     }
   });
 
-  const editingText = appState.editingTextElement;
-  const editingContainer = getContainerElement(editingText, elementsMap);
-  // Submit captures a new shape label (or its empty cleanup) with the resize.
-  const deferCapture =
-    editingText &&
-    editingContainer &&
-    !isArrowElement(editingContainer) &&
-    !isStickyNoteElement(editingContainer) &&
-    "store" in app &&
-    app.store instanceof Store &&
-    !app.store.snapshot.elements.has(editingText.id);
-
   return {
     elements: updatedElements,
     appState: {
@@ -371,9 +357,7 @@ const changeFontSize = (
           ? [...newFontSizes][0]
           : fallbackValue ?? appState.currentItemFontSize,
     },
-    captureUpdate: deferCapture
-      ? CaptureUpdateAction.EVENTUALLY
-      : CaptureUpdateAction.IMMEDIATELY,
+    captureUpdate: CaptureUpdateAction.IMMEDIATELY,
   };
 };
 

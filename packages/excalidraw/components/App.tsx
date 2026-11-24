@@ -3150,7 +3150,19 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    this.store.scheduleAction(actionResult.captureUpdate);
+    const currentEditingText = this.state.editingTextElement;
+    // Leave property edits (including font preview resets) in the draft so
+    // submit can capture the shape resize with the final label or its cleanup.
+    const deferCapture =
+      actionResult.elements &&
+      currentEditingText &&
+      actionResult.appState?.editingTextElement?.id === currentEditingText.id &&
+      this.text.isEditingNewShapeLabel(currentEditingText.id);
+    this.store.scheduleAction(
+      deferCapture
+        ? CaptureUpdateAction.EVENTUALLY
+        : actionResult.captureUpdate,
+    );
 
     let didUpdate = false;
 

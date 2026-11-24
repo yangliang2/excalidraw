@@ -1,0 +1,38 @@
+name: RTL opacity browser check
+on:
+  pull_request:
+    paths:
+      - packages/excalidraw/components/Range.*
+      - packages/excalidraw/actions/actionProperties.tsx
+      - scripts/browser/**
+      - .github/workflows/rtl-opacity.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rtl-opacity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn playwright install --with-deps chromium
+      - name: Verify production opacity, scene data, undo/redo and reload
+        run: python3 scripts/browser/check-rtl-production.py
+      - name: Retain production browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rtl-opacity-production
+          path: test-results/rtl-opacity/
+          retention-days: 14
+          if-no-files-found: error

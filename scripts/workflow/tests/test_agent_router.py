@@ -203,6 +203,29 @@ class RouterTests(unittest.TestCase):
         # Either we observe the event, or shutdown cannot drain it: neither may replay.
         self.assertNotEqual(self.journal()['status'],'completed')
 
+    def test_killed_worker_does_not_trigger_automatic_repair(self):
+        module_spec=importlib.util.spec_from_file_location('interrupted_loop',ROOT/'loop.py')
+        loop=importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(loop)
+        folder=self.root/'interrupted-state'
+        run=folder/'runs/killed'
+        run.mkdir(parents=True)
+        for name in ('stdout','stderr'):(run/name).write_text('')
+        receipt={'run_id':'killed','returncode':-signal.SIGKILL,
+                 'stdout':'runs/killed/stdout','stderr':'runs/killed/stderr',
+                 'stdout_sha256':loop.sha(b''),'stderr_sha256':loop.sha(b'')}
+        loop.save(run/'result.json',receipt)
+        step={'id':'work','kind':'work','deps':[]}
+        plan={'repo':str(self.repo),'base_ref':'HEAD','spec_files':['spec.md'],
+              'steps':[step],'_adapter_hashes':{},'max_repairs':1}
+        candidate=loop.snapshot(plan)
+        state={'candidate':candidate,'repairs':0,'steps':{'work':{'status':'running'}},
+               'history':[],'running':{'run_id':'killed','step':step,'candidate':candidate}}
+        loop.finish(plan,state,folder)
+        self.assertEqual(loop.inspect(plan,state,folder)['status'],'environment-error')
+        self.assertEqual(state['repairs'],0)
+        self.assertEqual(state['steps']['work']['status'],'environment-error')
+
     def test_worker_timeout_stops_term_ignoring_descendant(self):
         import fcntl
         runs=self.root/'worker-state/runs/timeout'

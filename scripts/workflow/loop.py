@@ -151,7 +151,7 @@ def finish(p, state, folder):
     outcome = 'passed' if r['returncode'] == 0 else 'failed'
     if r.get('returncode') == 75:
         outcome = 'waiting'
-    if r.get('returncode') == 2 or r.get('timeout') or r.get('launch_error'):
+    if r.get('returncode') == 2 or r.get('returncode', 0) < 0 or r.get('timeout') or r.get('launch_error'):
         outcome = 'environment-error'
     if kind in ('check', 'review') and current != running['candidate']:
         outcome = 'environment-error'

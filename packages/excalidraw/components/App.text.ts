@@ -345,11 +345,8 @@ export class AppText {
         // A new empty label can still leave its shape resized. Capture that
         // change only if the size differs from the store's snapshot.
         const container =
-          isDeleted && !isExistingElement
-            ? getContainerElement(
-                element,
-                this.app.scene.getNonDeletedElementsMap(),
-              )
+          isDeleted && !isExistingElement && element.containerId
+            ? this.app.scene.getNonDeletedElement(element.containerId)
             : null;
         const previousContainer = container
           ? this.app.store.snapshot.elements.get(container.id)
@@ -362,6 +359,13 @@ export class AppText {
           !previousContainer.isDeleted &&
           (container.width !== previousContainer.width ||
             container.height !== previousContainer.height);
+
+        if (didResizeContainer) {
+          // History redraws bound arrows, so capture their updated geometry too.
+          updateBoundElements(container, this.app.scene, {
+            renderEnvironment: this.app.renderEnvironment,
+          });
+        }
 
         if (!isDeleted || isExistingElement || didResizeContainer) {
           this.app.store.scheduleCapture();

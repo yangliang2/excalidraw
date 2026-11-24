@@ -5211,10 +5211,12 @@ class App extends React.Component<AppProps, AppState> {
       const isEditingNewShapeLabel =
         editingText && this.text.isEditingNewShapeLabel(editingText.id);
       if (
-        captureUpdate === CaptureUpdateAction.NEVER &&
         appState &&
-        (this.appStateOnlyCapture || isEditingNewShapeLabel)
+        (this.appStateOnlyCapture || isEditingNewShapeLabel) &&
+        (captureUpdate === CaptureUpdateAction.NEVER ||
+          (captureUpdate === CaptureUpdateAction.IMMEDIATELY && !elements))
       ) {
+        // Coalesce app-state-only edits with canvas actions in call order.
         this.queueDraftAppStateUpdate(captureUpdate, appState, elements);
       } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;

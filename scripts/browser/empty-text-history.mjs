@@ -18,6 +18,10 @@ const recordEnvironmentError = (error) => {
   environmentError ??= String(error);
   console.error("Browser check environment error", error);
 };
+const saveScreenshot = async (page, filename) => {
+  const image = await page.screenshot();
+  await writeFile(`${output}/${filename}`, image).catch(recordEnvironmentError);
+};
 
 let checks = 0;
 try {
@@ -56,7 +60,7 @@ try {
       assert.ok(
         resized.width > original.width || resized.height > original.height,
       );
-      await page.screenshot({ path: `${output}/${type}-resized.png` });
+      await saveScreenshot(page, `${type}-resized.png`);
       await page.keyboard.press("ControlOrMeta+z");
       await page.waitForTimeout(700);
       const afterUndo = await read();
@@ -70,7 +74,7 @@ try {
       for (const key of ["x", "y", "width", "height"])
         assert.equal(restored[key], original[key]);
       checks++;
-      await page.screenshot({ path: `${output}/${type}-undo.png` });
+      await saveScreenshot(page, `${type}-undo.png`);
       await page.keyboard.press("ControlOrMeta+Shift+z");
       await page.waitForTimeout(700);
       const afterRedo = await read();
@@ -103,9 +107,11 @@ try {
         recordEnvironmentError(error);
       } else {
         failures.push({ type, error: String(error) });
-        await page
-          ?.screenshot({ path: `${output}/${type}-failure.png` })
-          .catch(recordEnvironmentError);
+        if (page) {
+          await saveScreenshot(page, `${type}-failure.png`).catch(
+            recordEnvironmentError,
+          );
+        }
       }
     } finally {
       await context?.close().catch(recordEnvironmentError);

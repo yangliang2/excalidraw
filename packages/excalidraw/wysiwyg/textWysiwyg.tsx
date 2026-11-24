@@ -245,7 +245,10 @@ const getLineCaretXFromNativeLayout = ({
   return measured ? measured.positions[0] - measured.left : null;
 };
 
-type SubmitHandler = () => void;
+type TextEditor = {
+  submit: () => void;
+  discard: () => void;
+};
 
 export const textWysiwyg = ({
   onChange,
@@ -276,7 +279,7 @@ export const textWysiwyg = ({
   initialCaretSceneCoords?: { x: number; y: number } | null;
   /** range of `originalText` to select (takes precedence over the caret) */
   initialSelection?: { start: number; end: number } | null;
-}): SubmitHandler => {
+}): TextEditor => {
   const ownerDocument = excalidrawContainer?.ownerDocument ?? document;
   const ownerWindow = ownerDocument.defaultView ?? window;
   // the editor's box: the part of the canvas a caret is revealed into (see

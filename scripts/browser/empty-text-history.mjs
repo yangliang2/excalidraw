@@ -101,9 +101,10 @@ try {
     } catch (error) {
       const previewUnavailable =
         navigating &&
-        /net::ERR_(CONNECTION_REFUSED|CONNECTION_RESET|CONNECTION_CLOSED|EMPTY_RESPONSE|TIMED_OUT)\b/.test(
-          String(error),
-        );
+        (error?.name === "TimeoutError" ||
+          /net::ERR_(CONNECTION_REFUSED|CONNECTION_RESET|CONNECTION_CLOSED|EMPTY_RESPONSE|TIMED_OUT)\b/.test(
+            String(error),
+          ));
       if (
         !(error instanceof assert.AssertionError) &&
         (!page || !browser.isConnected() || previewUnavailable)

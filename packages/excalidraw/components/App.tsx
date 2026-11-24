@@ -480,6 +480,7 @@ import type { Action, ActionResult } from "../actions/types";
 type DraftSceneUpdate = {
   action: CaptureUpdateActionType;
   change: StoreChange;
+  coalescible: boolean;
   previousAppState?: ObservedAppState;
 };
 
@@ -3174,6 +3175,7 @@ class App extends React.Component<AppProps, AppState> {
       : this.state;
 
   private queueDraftSceneUpdate(
+    source: "action" | "updateScene",
     appState: Partial<AppState>,
     action?: CaptureUpdateActionType,
     elements?: SceneData["elements"],
@@ -3219,14 +3221,12 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     const last = capture.queue.at(-1);
-    const hasElements = !!Object.keys(change.elements).length;
+    // Canvas actions share a history entry within a batch. Each explicit
+    // updateScene capture has its own history boundary.
+    const coalescible =
+      source === "action" && action === CaptureUpdateAction.IMMEDIATELY;
     const update: DraftSceneUpdate =
-      !hasElements &&
-      action === CaptureUpdateAction.IMMEDIATELY &&
-      last?.action === action &&
-      !Object.keys(last.change.elements).length
-        ? last
-        : { action, change };
+      coalescible && last?.coalescible ? last : { action, change, coalescible };
 
     if (action === CaptureUpdateAction.EVENTUALLY) {
       update.previousAppState = getObservedAppState(current);
@@ -3234,16 +3234,16 @@ class App extends React.Component<AppProps, AppState> {
 
     for (const key of keys) {
       if (action === CaptureUpdateAction.IMMEDIATELY) {
-        // Coalesce pending state edits. A capture with element changes closes
-        // the pending edit for the fields it commits with those elements.
+        // Supersede any pending canvas edit to fields this capture writes.
+        // Only canvas edits can be superseded by a later immediate capture.
         const pending = capture.pendingFields.get(key);
         if (pending) {
           delete pending.change.appState[key];
         }
-        if (hasElements) {
-          capture.pendingFields.delete(key);
-        } else {
+        if (coalescible) {
           capture.pendingFields.set(key, update);
+        } else {
+          capture.pendingFields.delete(key);
         }
       } else if (action === CaptureUpdateAction.NEVER) {
         capture.pendingFields.delete(key);
@@ -3375,6 +3375,7 @@ class App extends React.Component<AppProps, AppState> {
         }
       }
       this.queueDraftSceneUpdate(
+        "action",
         actionAppState,
         captureAppStateSeparately ? actionResult.captureUpdate : undefined,
       );
@@ -5301,7 +5302,12 @@ class App extends React.Component<AppProps, AppState> {
       const isEditingNewShapeLabel =
         editingText && this.text.isEditingNewShapeLabel(editingText.id);
       if (this.draftSceneCapture || isEditingNewShapeLabel) {
-        this.queueDraftSceneUpdate(appState ?? {}, captureUpdate, elements);
+        this.queueDraftSceneUpdate(
+          "updateScene",
+          appState ?? {},
+          captureUpdate,
+          elements,
+        );
       } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;
         const observedAppState = appState

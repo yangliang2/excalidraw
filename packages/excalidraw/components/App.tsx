@@ -190,6 +190,8 @@ import {
   getDragOffsetXY,
   Scene,
   Store,
+  StoreChange,
+  StoreSnapshot,
   CaptureUpdateAction,
   type ElementUpdate,
   hitElementBoundingBox,
@@ -781,6 +783,7 @@ class App extends React.Component<AppProps, AppState> {
   /** offsets of `elementRenderOverrides`; keeps its identity while they don't change */
   private elementRenderOffsets: ElementRenderOffsets = new Map();
   private renderOverridesUpdatePending = false;
+  private captureAppStateOnlyOnCommit = false;
 
   private getRenderOverrideConfig = () => ({
     elementRenderOverrides: this.elementRenderOverrides,
@@ -3162,13 +3165,17 @@ class App extends React.Component<AppProps, AppState> {
     ) {
       // Capture app state changes such as canvas background independently of
       // the draft label and its container resize.
-      this.store.scheduleMicroAction({
-        action: actionResult.captureUpdate,
-        elements: undefined,
-        appState: actionResult.appState
-          ? { ...this.state, ...actionResult.appState }
-          : undefined,
-      });
+      if (actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY) {
+        this.captureAppStateOnlyOnCommit ||= !!actionResult.appState;
+      } else {
+        this.store.scheduleMicroAction({
+          action: actionResult.captureUpdate,
+          elements: undefined,
+          appState: actionResult.appState
+            ? { ...this.state, ...actionResult.appState }
+            : undefined,
+        });
+      }
     } else {
       // Leave property edits (including font preview resets) in the draft so
       // submit can capture the shape resize with the final label or its cleanup.
@@ -4546,6 +4553,25 @@ class App extends React.Component<AppProps, AppState> {
       this.setState({ scrolledOutside });
     }
 
+    if (this.captureAppStateOnlyOnCommit) {
+      this.captureAppStateOnlyOnCommit = false;
+      // Use the committed app state so updates in the same React batch are
+      // recorded together, including when they cancel one another out.
+      const action = CaptureUpdateAction.IMMEDIATELY;
+      const previous = StoreSnapshot.create(
+        StoreSnapshot.empty().elements,
+        prevState,
+      );
+      const next = previous.maybeClone(action, undefined, this.state);
+      if (next !== previous) {
+        this.store.scheduleMicroAction({
+          action,
+          change: StoreChange.create(previous, next),
+          delta: StoreDelta.calculate(previous, next),
+        });
+      }
+    }
+
     this.store.commit(elementsMap, this.state);
 
     // Do not notify consumers if we're still loading the scene. Among other
@@ -4677,6 +4703,16 @@ class App extends React.Component<AppProps, AppState> {
     const elements = restoreElements(opts.elements, null, {
       deleteInvisibleElements: true,
     });
+    const { editingTextElement } = this.state;
+    if (
+      editingTextElement &&
+      this.text.isEditingNewShapeLabel(editingTextElement.id)
+    ) {
+      // Insertion selects new elements. Submit the label before taking the
+      // scene used for insertion so its resize and cleanup have their own undo.
+      this.text.textWysiwygSubmitHandler?.();
+    }
+
     const clientX =
       typeof opts.position === "object"
         ? opts.position.clientX

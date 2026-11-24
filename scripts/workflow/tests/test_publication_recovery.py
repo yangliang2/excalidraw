@@ -29,8 +29,8 @@ class PublicationRecoveryTests(unittest.TestCase):
     def git(self,*args):return subprocess.check_output(['git','-C',str(self.repo),*args],text=True,stderr=subprocess.DEVNULL).strip()
     def command(self,name,code):
         p=self.root/(name+'.py');p.write_text(code+'\n');return [sys.executable,str(p)]
-    def cli(self,cmd,expected,env=None):
-        result=subprocess.run([sys.executable,str(ROOT/'loop.py'),cmd,'--plan',str(self.plan_path),'--state',str(self.state)],capture_output=True,text=True,env=env,timeout=20)
+    def cli(self,cmd,expected,env=None,extra=()):
+        result=subprocess.run([sys.executable,str(ROOT/'loop.py'),cmd,'--plan',str(self.plan_path),'--state',str(self.state),*extra],capture_output=True,text=True,env=env,timeout=20)
         self.assertEqual(result.returncode,expected,result.stdout+result.stderr);return json.loads(result.stdout)
     def init(self):self.plan_path.write_text(json.dumps(self.plan));self.cli('init',1)
     def test_repair_republishes_new_head_without_repeating_implementation(self):
@@ -54,5 +54,37 @@ class PublicationRecoveryTests(unittest.TestCase):
     def test_non_boolean_replay_policy_is_rejected(self):
         self.plan['steps'][1]['invalidate_on_change']='false';self.plan_path.write_text(json.dumps(self.plan))
         self.assertIn('boolean',self.cli('init',2)['reason'])
+
+    def test_same_candidate_repair_rechecks_without_republishing(self):
+        fixed=self.root/'fixed'
+        self.plan['repair']['argv']=self.command('same-head-repair',f"from pathlib import Path\nPath({str(fixed)!r}).touch()")
+        self.plan['steps'][3]['argv']=self.command('same-head-review',f"import json,os\nfrom pathlib import Path\nok=Path({str(fixed)!r}).exists()\nprint(json.dumps({{'candidate_id':os.environ['WORKFLOW_CANDIDATE_ID'],'reviewer':'explicit fixture','decision':'pass' if ok else 'rework','findings':[] if ok else ['retry verification']}}))")
+        self.init();self.cli('run',3)
+        self.assertEqual(self.publications.read_text().splitlines(),[self.head])
+        self.assertEqual(self.work_count.read_text(),'x')
+        state=json.loads((self.state/'state.json').read_text())
+        self.assertEqual(len([x for x in state['history'] if x.get('step')=='verify']),2)
+
+    def test_environment_check_retry_preserves_implementation_and_publication(self):
+        restored=self.root/'remote-restored'
+        self.plan['max_repairs']=0
+        self.plan['steps'][2]['argv']=self.command('environment-check',f"from pathlib import Path\nraise SystemExit(0 if Path({str(restored)!r}).exists() else 2)")
+        self.plan['steps'][3]['argv']=self.command('passing-review',"import json,os\nprint(json.dumps({'candidate_id':os.environ['WORKFLOW_CANDIDATE_ID'],'reviewer':'explicit fixture','decision':'pass','findings':[]}))")
+        self.init();self.cli('run',2)
+        before=json.loads((self.state/'state.json').read_text())
+        self.cli('retry',2,extra=['--step','publish'])
+        restored.touch();self.cli('retry',1,extra=['--step','verify']);self.cli('run',3)
+        after=json.loads((self.state/'state.json').read_text())
+        self.assertEqual(after['steps']['implement'],before['steps']['implement'])
+        self.assertEqual(after['steps']['publish'],before['steps']['publish'])
+        self.assertEqual(self.publications.read_text().splitlines(),[self.head])
+        self.assertEqual(self.work_count.read_text(),'x')
+        self.assertEqual(after['repairs'],0)
+
+    def test_environment_retry_rejects_changed_candidate(self):
+        self.plan['steps'][2]['argv']=self.command('environment-check',"raise SystemExit(2)")
+        self.init();self.cli('run',2)
+        (self.repo/'value').write_text('changed');self.git('add','value');self.git('commit','-qm','changed')
+        self.assertIn('changed',self.cli('retry',2,extra=['--step','verify'])['reason'])
 
 if __name__=='__main__':unittest.main()

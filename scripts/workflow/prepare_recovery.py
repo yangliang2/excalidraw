@@ -36,7 +36,7 @@ plan={'schema':1,'repo':str(repo),'base_ref':'41f33a9581330d7eee664ad083274b1fe4
       {'id':'document-recovery','kind':'work','deps':[],'ac':ac,'argv':agent('work'),'timeout':2500},
       {'id':'recovery-tests','kind':'check','deps':['document-recovery'],'ac':ac,'argv':[sys.executable,'-m','unittest','discover','-s','scripts/workflow/tests','-v'],'timeout':120},
       {'id':'production-browser','kind':'check','deps':['document-recovery'],'ac':['REC-4'],'argv':[sys.executable,'scripts/browser/check-rtl-production.py'],'timeout':1200},
-      {'id':'publish','kind':'work','deps':['recovery-tests','production-browser'],'ac':['REC-4'],'argv':command('publish_rtl.py'),'timeout':120},
+      {'id':'publish','kind':'work','invalidate_on_change':True,'deps':['recovery-tests','production-browser'],'ac':['REC-4'],'argv':command('publish_rtl.py'),'timeout':120},
       {'id':'github-ci','kind':'check','deps':['publish'],'ac':['REC-4'],'argv':command('github_gate.py')+['--repo','yangliang2/excalidraw','--pr','14']+sum([['--required',x] for x in ['agent-recovery','browser','coverage','lint','size','semantic','label-scope']],[]),'timeout':120},
       {'id':'review','kind':'review','deps':['github-ci'],'ac':ac,'argv':agent('review'),'timeout':2500},
       {'id':'product','kind':'human','deps':['review'],'ac':ac}]}

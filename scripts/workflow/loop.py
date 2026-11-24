@@ -67,6 +67,8 @@ def load_plan(path):
             raise ValueError('every step must reference known acceptance IDs')
         if not set(s.get('deps', [])) <= set(ids):
             raise ValueError('unknown dependency')
+        if not isinstance(s.get('invalidate_on_change', False), bool):
+            raise ValueError('invalidate_on_change must be boolean')
         if s['kind'] != 'human':
             validate_command(s)
     byid = {s['id']: s for s in steps}
@@ -123,7 +125,7 @@ def snapshot(p):
 
 def invalidate(p, state):
     for s in p['steps']:
-        if s['kind'] != 'work':
+        if s['kind'] != 'work' or s.get('invalidate_on_change', False):
             state['steps'][s['id']] = {'status': 'pending'}
 
 

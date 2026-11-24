@@ -12,9 +12,9 @@ import time
 
 def evaluate(info, head, base, required):
     if info.get('state') != 'OPEN':
-        return {'status': 'rework', 'reason': 'PR is not open'}
+        return {'status': 'environment-error', 'reason': 'PR is not open'}
     if info.get('headRefOid') != head or (base and info.get('baseRefOid') != base):
-        return {'status': 'rework', 'reason': 'remote PR candidate/base differs from local evidence'}
+        return {'status': 'environment-error', 'reason': 'remote PR candidate/base differs from local evidence; reconcile publication or baseline before retry'}
     checks = {}
     for item in info.get('statusCheckRollup') or []:
         name = item.get('name') or item.get('context')

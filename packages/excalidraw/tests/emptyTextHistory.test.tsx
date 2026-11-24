@@ -76,7 +76,7 @@ describe.each(shapes)("empty text history: %s", (type) => {
     Keyboard.exitTextEditor(editor);
     const text = h.elements.find((el) => !el.isDeleted && el.type === "text")!;
     expect(text).toMatchObject({
-      text: "Order approved",
+      originalText: "Order approved",
       containerId: container.id,
     });
     const resized = geometry(live(container.id)!);
@@ -86,7 +86,7 @@ describe.each(shapes)("empty text history: %s", (type) => {
     Keyboard.redo();
     expect(live(container.id)).toMatchObject(resized);
     expect(live(text.id)).toMatchObject({
-      text: "Order approved",
+      originalText: "Order approved",
       containerId: container.id,
     });
     expect(live(container.id)!.boundElements).toContainEqual({

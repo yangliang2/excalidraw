@@ -396,6 +396,11 @@ def main():
                     if (not step or step['kind'] not in ('check', 'review')
                             or state['steps'][args.step]['status'] != 'environment-error'):
                         raise ValueError('retry requires an environment-error check or review')
+                    prior = state['steps'][args.step]
+                    receipt_path = folder / prior['receipt']
+                    if (not receipt_path.is_file() or sha(receipt_path.read_bytes()) != prior['receipt_sha256']
+                            or not receipt_valid(read(receipt_path), folder)):
+                        raise ValueError('environment-error evidence changed; reconcile before retry')
                     state['history'].append({'event': 'retry-check', 'step': args.step,
                                              'prior': state['steps'][args.step]})
                     state['steps'][args.step] = {'status': 'pending'}

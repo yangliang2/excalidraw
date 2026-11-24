@@ -87,4 +87,13 @@ class PublicationRecoveryTests(unittest.TestCase):
         (self.repo/'value').write_text('changed');self.git('add','value');self.git('commit','-qm','changed')
         self.assertIn('changed',self.cli('retry',2,extra=['--step','verify'])['reason'])
 
+    def test_environment_retry_rejects_tampered_failed_evidence(self):
+        self.plan['steps'][2]['argv']=self.command('environment-check',"raise SystemExit(2)")
+        self.init();self.cli('run',2)
+        state=json.loads((self.state/'state.json').read_text())
+        receipt=json.loads((self.state/state['steps']['verify']['receipt']).read_text())
+        (self.state/receipt['stdout']).write_text('tampered')
+        self.assertIn('evidence changed',self.cli('retry',2,extra=['--step','verify'])['reason'])
+        self.assertEqual(json.loads((self.state/'state.json').read_text())['steps']['verify'],state['steps']['verify'])
+
 if __name__=='__main__':unittest.main()

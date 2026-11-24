@@ -26,11 +26,15 @@ it("keeps a connected arrow identical on empty resize submission and repeated re
     points: [pointFrom(0, 0), pointFrom(0, -52)],
     endBinding: { elementId: rect.id, mode: "inside", fixedPoint: [0.5, 0.8] },
   });
-  rect.boundElements = [{ id: arrow.id, type: "arrow" }];
   await render(
     <Excalidraw
       handleKeyboardGlobally={true}
-      initialData={{ elements: [rect, arrow] }}
+      initialData={{
+        elements: [
+          { ...rect, boundElements: [{ id: arrow.id, type: "arrow" }] },
+          arrow,
+        ],
+      }}
     />,
   );
   const endY = () => {

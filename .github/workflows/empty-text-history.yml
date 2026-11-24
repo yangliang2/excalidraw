@@ -1,13 +1,5 @@
 name: Empty text history acceptance
-on:
-  pull_request:
-    paths:
-      - packages/**
-      - excalidraw-app/**
-      - scripts/**
-      - package.json
-      - yarn.lock
-      - .github/workflows/empty-text-history.yml
+on: pull_request
 
 permissions:
   contents: read

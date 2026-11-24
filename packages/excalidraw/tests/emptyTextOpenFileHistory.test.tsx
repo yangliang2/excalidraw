@@ -37,6 +37,8 @@ it("review probe: undo Open File while an empty label is active", async () => {
   });
   mouse.doubleClickAt(205, 205);
   const editor = await getTextEditor();
+  // The editor installs its capture listener on the next animation frame.
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   spy.mockResolvedValueOnce(sceneFile());
   const button = h.app.ownerDocument.querySelector<HTMLButtonElement>(
     "button.properties-trigger",

@@ -342,7 +342,28 @@ export class AppText {
           ]);
         }
 
-        if (!isDeleted || isExistingElement) {
+        // A new empty label can still leave its shape resized. Capture that
+        // change only if the size differs from the store's snapshot.
+        const container =
+          isDeleted && !isExistingElement
+            ? getContainerElement(
+                element,
+                this.app.scene.getNonDeletedElementsMap(),
+              )
+            : null;
+        const previousContainer = container
+          ? this.app.store.snapshot.elements.get(container.id)
+          : null;
+        const didResizeContainer =
+          container &&
+          !isArrowElement(container) &&
+          !isStickyNoteElement(container) &&
+          previousContainer &&
+          !previousContainer.isDeleted &&
+          (container.width !== previousContainer.width ||
+            container.height !== previousContainer.height);
+
+        if (!isDeleted || isExistingElement || didResizeContainer) {
           this.app.store.scheduleCapture();
         }
 

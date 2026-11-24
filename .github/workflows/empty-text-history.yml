@@ -2,10 +2,11 @@ name: Empty text history acceptance
 on:
   pull_request:
     paths:
-      - packages/excalidraw/components/App.text.ts
-      - packages/excalidraw/wysiwyg/**
-      - packages/excalidraw/tests/emptyTextHistory.test.tsx
-      - scripts/browser/**
+      - packages/**
+      - excalidraw-app/**
+      - scripts/**
+      - package.json
+      - yarn.lock
       - .github/workflows/empty-text-history.yml
 
 permissions:

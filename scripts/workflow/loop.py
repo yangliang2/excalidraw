@@ -12,6 +12,8 @@ import sys
 import time
 import uuid
 
+from task_budget import Budget, validate as validate_budget_report
+
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
@@ -95,12 +97,32 @@ def load_plan(path):
         raise ValueError('max_repairs must be 0..10')
     if p.get('repair'):
         validate_command(p['repair'])
+    if p.get('task_id'):
+        if not isinstance(p['task_id'], str) or not p['task_id'].strip() or len(p['task_id']) > 200:
+            raise ValueError('task_id must be a stable nonempty requirement identifier')
+        policy = p.setdefault('budget', {})
+        for mode in ('assess', 'design'):
+            validate_command(policy[mode])
+        delay = policy.get('backoff_seconds', 2)
+        if type(delay) is not int or not 0 <= delay <= 30:
+            raise ValueError('budget backoff_seconds must be 0..30')
+        if not p.get('repair'):
+            raise ValueError('task budgets require a repair command')
+        for step in steps:
+            if not isinstance(step.get('retry_safe', False), bool):
+                raise ValueError('retry_safe must be boolean')
+    elif 'task_id' in p or 'budget' in p:
+        raise ValueError('budget requires stable task_id')
     adapters = {}
-    for command in [s for s in steps if s['kind'] != 'human'] + ([p['repair']] if p.get('repair') else []):
+    for command in ([s for s in steps if s['kind'] != 'human'] + ([p['repair']] if p.get('repair') else [])
+                    + ([p['budget'][m] for m in ('assess', 'design')] if p.get('task_id') else [])):
         for arg in command['argv']:
             f = Path(arg)
             if f.is_absolute() and f.is_file() and not f.resolve().is_relative_to(repo):
                 adapters[str(f.resolve())] = sha(f.read_bytes())
+    for runtime in (Path(__file__).resolve(), Path(__file__).with_name('task_budget.py').resolve()):
+        if not runtime.is_relative_to(repo):
+            adapters[str(runtime)] = sha(runtime.read_bytes())
     p['_adapter_hashes'] = adapters
     return p, sha(raw + json.dumps(adapters, sort_keys=True).encode())
 
@@ -155,7 +177,7 @@ def finish(p, state, folder):
         outcome = 'waiting'
     if r.get('returncode') == 2 or r.get('returncode', 0) < 0 or r.get('timeout') or r.get('launch_error'):
         outcome = 'environment-error'
-    if kind in ('check', 'review') and current != running['candidate']:
+    if kind in ('check', 'review', 'assess', 'design') and current != running['candidate']:
         outcome = 'environment-error'
     report = None
     if kind == 'review' and outcome == 'passed':
@@ -170,6 +192,13 @@ def finish(p, state, folder):
             outcome = {'pass': 'passed', 'rework': 'failed', 'human': 'awaiting-human'}[report['decision']]
         except (ValueError, KeyError, TypeError):
             outcome = 'environment-error'
+    if kind in ('assess', 'design') and outcome == 'passed':
+        try:
+            report = json.loads((folder / r['stdout']).read_text())
+            request = read(result_path.with_name('request.json'))
+            validate_budget_report(report, kind, current, request['failure_runs'])
+        except (ValueError, KeyError, TypeError):
+            outcome = 'environment-error'
     if kind in ('work', 'repair') and (current['spec'] != running['candidate']['spec'] or current['base'] != running['candidate']['base']):
         outcome = 'environment-error'
         state['halt'] = {'status': 'awaiting-human', 'reason': 'work changed specification or baseline; review scope before refresh'}
@@ -179,10 +208,16 @@ def finish(p, state, folder):
     result = {'status': outcome, 'run_id': r['run_id'], 'candidate': current,
               'receipt': str(result_path.relative_to(folder)), 'receipt_sha256': sha(result_path.read_bytes())}
     if report is not None:
-        result['review'] = report
+        result['report' if kind in ('assess', 'design') else 'review'] = report
     state['history'].append({'step': step['id'], **result})
     state['running'] = None
-    if kind == 'repair':
+    if kind in ('assess', 'design'):
+        if outcome == 'passed':
+            Budget(p).record_control(kind, state, folder, result, step)
+        else:
+            state['halt'] = {'status': 'environment-error',
+                             'reason': 'budget control failed; inspect receipt before retry', 'run_id': r['run_id']}
+    elif kind == 'repair':
         if outcome == 'passed':
             invalidate(p, state, replay_work=False)  # recheck same-SHA repairs without replaying successful work
             for value in state['steps'].values():
@@ -196,6 +231,13 @@ def finish(p, state, folder):
         state['steps'][step['id']] = result
     save(folder/'state.json', state)
     return None
+
+
+def verify_record(record, folder):
+    path = folder / record['receipt']
+    if (not path.is_file() or sha(path.read_bytes()) != record['receipt_sha256']
+            or not receipt_valid(read(path), folder)):
+        raise ValueError('failed evidence changed; reconcile before retry/assessment')
 
 
 def verify_evidence(state, folder):
@@ -226,6 +268,10 @@ def inspect(p, state, folder):
     problem = verify_evidence(state, folder)
     if problem:
         return {'status': 'rework', 'reason': problem}
+    if p.get('task_id'):
+        hold = Budget(p).pending_hold()
+        if hold:
+            return hold
     if state.get('halt'):
         return state['halt']
     values = state['steps']
@@ -261,7 +307,9 @@ def worker(request_path, lock_fd):
     result = {'run_id': req['run_id'], 'started_at': time.time(), 'returncode': None}
     env = os.environ.copy()
     env.update({'WORKFLOW_RUN_ID': req['run_id'], 'WORKFLOW_CANDIDATE_ID': req['candidate']['id'],
-                'WORKFLOW_REQUEST': str(request_path)})
+                'WORKFLOW_REQUEST': str(request_path),
+                'ARTIFACT_DIR': str(folder/'artifacts'), 'WORKFLOW_ARTIFACT_DIR': str(folder/'artifacts')})
+    (folder/'artifacts').mkdir(exist_ok=True)
     try:
         with (folder/'stdout.log').open('wb') as out, (folder/'stderr.log').open('wb') as err:
             child = subprocess.Popen(req['step']['argv'], cwd=req['repo'], stdout=out, stderr=err,
@@ -289,7 +337,7 @@ def worker(request_path, lock_fd):
         result[name] = str(path.relative_to(folder.parent.parent))
         result[name + '_sha256'] = sha(path.read_bytes())
     result['attachments'] = {str(p.relative_to(folder.parent.parent)): sha(p.read_bytes())
-                             for p in (folder/'agents').rglob('*') if p.is_file()
+                             for root in (folder/'agents', folder/'artifacts') for p in root.rglob('*') if p.is_file()
                              and p.resolve().is_relative_to(folder.resolve())}
     result['finished_at'] = time.time()
     save(folder/'result.json', result)
@@ -302,6 +350,14 @@ def execute(p, state, folder, step, lock_fd):
     target.mkdir(parents=True)
     request = {'run_id': run_id, 'repo': p['repo'], 'candidate': state['candidate'], 'step': step,
                'prior_failures': [h for h in state['history'] if h.get('status') not in (None, 'passed')]}
+    if p.get('task_id'):
+        budget = Budget(p)
+        request['budget'] = budget.context()
+        request['failure_runs'] = sorted(v['run_id'] for v in state['steps'].values() if v['status'] == 'failed')
+        if step['kind'] == 'repair':
+            budget.reserve_repair(run_id, state['candidate'])
+        elif step['kind'] == 'work' and not step.get('invalidate_on_change', False):
+            budget.reserve_initial_work(run_id)
     save(target/'request.json', request)
     state['running'] = {'run_id': run_id, 'candidate': state['candidate'], 'step': step}
     save(folder/'state.json', state)
@@ -328,8 +384,27 @@ def run(p, state, folder, lock_fd):
             state['steps'][key] = {'status': 'pending'}
             save(folder/'state.json', state)
             step = next(s for s in p['steps'] if s['id'] == key)
+        elif result.get('step') and result['status'] == 'environment-error' and p.get('task_id'):
+            key = result['step']
+            retry = Budget(p).retry(state, folder, key, verify_record, automatic=True)
+            if retry is None:
+                return result
+            state['history'].append({'event': 'automatic-environment-retry', 'step': key,
+                                     'retry': retry, 'prior': state['steps'][key]})
+            state['steps'][key] = {'status': 'pending'}
+            save(folder/'state.json', state)
+            step = next(s for s in p['steps'] if s['id'] == key)
         elif result.get('failed') and p.get('repair'):
-            if state['repairs'] >= p.get('max_repairs', 0):
+            if p.get('task_id'):
+                choice = Budget(p).choose(state, folder, result['failed'], verify_record)
+                if 'status' in choice:
+                    return choice
+                if choice['kind'] in ('assess', 'design'):
+                    unresolved = execute(p, state, folder, choice, lock_fd)
+                    if unresolved:
+                        return unresolved
+                    continue
+            elif state['repairs'] >= p.get('max_repairs', 0):
                 return {'status': 'awaiting-human', 'reason': 'repair budget exhausted', 'failed': result['failed']}
             state['repairs'] += 1
             step = {'argv': p['repair']['argv'], 'timeout': p['repair'].get('timeout', 300), 'id': '__repair__', 'kind': 'repair'}
@@ -346,7 +421,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == '_worker':
         worker(Path(sys.argv[2]), int(sys.argv[3])); return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['init', 'gate', 'run', 'refresh', 'retry', 'decide', 'reconcile'])
+    parser.add_argument('command', choices=['init', 'gate', 'run', 'refresh', 'retry', 'decide', 'reconcile', 'budget-import', 'budget-decide'])
     parser.add_argument('--plan', type=Path, required=True)
     parser.add_argument('--state', type=Path, required=True)
     parser.add_argument('--step')
@@ -374,14 +449,27 @@ def main():
                 state = {'schema': 1, 'plan_sha256': plan_sha, 'candidate': snapshot(p), 'repairs': 0,
                          'steps': {s['id']: {'status': 'pending'} for s in p['steps']},
                          'history': [], 'running': None}
+                Budget(p).attach(state['candidate'])
                 save(path, state)
                 result = inspect(p, state, folder)
             else:
+                Budget(p)  # Existing branch registrations cannot be disabled by a new plan.
                 state = read(path)
                 if state['plan_sha256'] != plan_sha:
                     raise ValueError('plan changed; review separately and initialize a new state directory')
                 if args.command == 'run':
                     result = run(p, state, folder, lock.fileno())
+                elif args.command == 'budget-decide':
+                    if (not p.get('task_id') or not args.source or not args.actor
+                            or state.get('running') or state.get('halt')
+                            or snapshot(p) != state['candidate']):
+                        raise ValueError('budget decision requires idle matching candidate and actual source')
+                    result = Budget(p).decide(args.source, args.actor, args.decision, state['candidate'])
+                elif args.command == 'budget-import':
+                    if (not p.get('task_id') or not args.source or state['history'] or state.get('running')):
+                        raise ValueError('budget-import needs unused state, task_id and source manifest')
+                    imported = Budget(p).import_history(read(args.source))
+                    result = {'status': 'rework', **imported}
                 elif args.command == 'gate':
                     result = inspect(p, state, folder)
                 elif args.command == 'retry':
@@ -401,6 +489,8 @@ def main():
                     if (not receipt_path.is_file() or sha(receipt_path.read_bytes()) != prior['receipt_sha256']
                             or not receipt_valid(read(receipt_path), folder)):
                         raise ValueError('environment-error evidence changed; reconcile before retry')
+                    if p.get('task_id') and Budget(p).retry(state, folder, args.step, verify_record, automatic=False) is None:
+                        raise ValueError('environment retry budget exhausted for this candidate/check')
                     state['history'].append({'event': 'retry-check', 'step': args.step,
                                              'prior': state['steps'][args.step]})
                     state['steps'][args.step] = {'status': 'pending'}
@@ -411,7 +501,10 @@ def main():
                         raise ValueError('unresolved execution; reconcile first')
                     state['history'].append({'event': 'refresh', 'prior': state['candidate'], 'steps': state['steps']})
                     state['candidate'] = snapshot(p)
-                    state['steps'] = {s['id']: {'status': 'pending'} for s in p['steps']}
+                    state['steps'] = {
+                        s['id']: state['steps'][s['id']]
+                        if p.get('task_id') and s['kind'] == 'work' and not s.get('invalidate_on_change', False)
+                        else {'status': 'pending'} for s in p['steps']}
                     state['halt'] = None
                     # Repair budget is lifetime per plan/state; refresh cannot reset it.
                     save(path, state)

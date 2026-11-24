@@ -10,6 +10,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location('router', ROOT/'agent_router.py')
 router = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(router)
@@ -64,6 +65,45 @@ class RouterTests(unittest.TestCase):
 
     def journal(self):
         return json.loads((self.request.parent/'agents/journal.json').read_text())
+
+    def test_budget_assessment_uses_read_only_provider_and_binds_evidence(self):
+        req=json.loads(self.request.read_text());req['failure_runs']=['failed-run'];req['budget']={}
+        self.request.write_text(json.dumps(req))
+        body = """assert sys.argv[sys.argv.index('--sandbox')+1]=='read-only'
+report=dict(candidate_id='candidate',decision='proceed',rationale='verified failure',evidence_runs=['failed-run'],scope_unchanged=True,findings=[dict(id='a',family='history',severity=2,summary='bug')])
+Path(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps(report))
+print(json.dumps(dict(type='thread.started',thread_id='budget-fixture')))
+"""
+        self.provider(self.primary,body)
+        result=self.run_router('assess')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(json.loads(result.stdout)['reviewer'],'codex session budget-fixture')
+
+    def test_assessment_fallback_receives_full_diff_with_read_only_tools(self):
+        req=json.loads(self.request.read_text());req['failure_runs']=['failed-run'];req['budget']={}
+        self.request.write_text(json.dumps(req))
+        self.provider(self.fallback,"""prompt=sys.stdin.read()
+assert '\"diff\"' in prompt and '\"changed_files\"' not in prompt
+assert sys.argv[sys.argv.index('--tools')+1]=='Read,Glob,Grep'
+report=dict(candidate_id='candidate',decision='proceed',rationale='fixture',evidence_runs=['failed-run'],scope_unchanged=True,findings=[dict(id='a',family='history',severity=2,summary='bug')])
+print(json.dumps(dict(type='result',is_error=False,session_id='fallback-budget-fixture',structured_output=report)))
+""")
+        result=self.run_router('assess')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(self.journal()['selected_provider'],'claude')
+
+    def test_mutating_design_review_is_rejected(self):
+        req=json.loads(self.request.read_text());req['failure_runs']=['failed-run'];req['budget']={}
+        self.request.write_text(json.dumps(req))
+        self.provider(self.primary,"""Path('answer.txt').write_text('unauthorized')
+report=dict(candidate_id='candidate',decision='proceed',rationale='design',evidence_runs=['failed-run'],plan='fix design')
+Path(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps(report))
+print(json.dumps(dict(type='thread.started',thread_id='budget-fixture')))
+""")
+        result=self.run_router('design')
+        self.assertEqual(result.returncode,2)
+        self.assertIn('read-only',self.journal()['reason'])
+        self.assertEqual((self.repo/'answer.txt').read_text(),'unauthorized')
 
     def test_capacity_retries_then_real_fallback_contract(self):
         result=self.run_router()

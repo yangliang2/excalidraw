@@ -3151,18 +3151,37 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     const currentEditingText = this.state.editingTextElement;
-    // Leave property edits (including font preview resets) in the draft so
-    // submit can capture the shape resize with the final label or its cleanup.
-    const deferCapture =
-      actionResult.elements &&
+    const isEditingNewShapeLabel =
       currentEditingText &&
-      actionResult.appState?.editingTextElement?.id === currentEditingText.id &&
       this.text.isEditingNewShapeLabel(currentEditingText.id);
-    this.store.scheduleAction(
-      deferCapture
-        ? CaptureUpdateAction.EVENTUALLY
-        : actionResult.captureUpdate,
-    );
+
+    if (
+      isEditingNewShapeLabel &&
+      !actionResult.elements &&
+      actionResult.captureUpdate !== CaptureUpdateAction.EVENTUALLY
+    ) {
+      // Capture app state changes such as canvas background independently of
+      // the draft label and its container resize.
+      this.store.scheduleMicroAction({
+        action: actionResult.captureUpdate,
+        elements: undefined,
+        appState: actionResult.appState
+          ? { ...this.state, ...actionResult.appState }
+          : undefined,
+      });
+    } else {
+      // Leave property edits (including font preview resets) in the draft so
+      // submit can capture the shape resize with the final label or its cleanup.
+      const deferCapture =
+        isEditingNewShapeLabel &&
+        actionResult.elements &&
+        actionResult.appState?.editingTextElement?.id === currentEditingText.id;
+      this.store.scheduleAction(
+        deferCapture
+          ? CaptureUpdateAction.EVENTUALLY
+          : actionResult.captureUpdate,
+      );
+    }
 
     let didUpdate = false;
 

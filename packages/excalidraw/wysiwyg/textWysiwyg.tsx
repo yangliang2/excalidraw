@@ -1027,17 +1027,22 @@ export const textWysiwyg = ({
   // using a state variable instead of passing it to the handleSubmit callback
   // so that we don't need to create separate a callback for event handlers
   let submittedViaKeyboard = false;
+  const discard = () => {
+    if (!isDestroyed) {
+      isDestroyed = true;
+      cleanup();
+    }
+  };
   const handleSubmit = () => {
     // prevent double submit
     if (isDestroyed) {
       return;
     }
 
-    isDestroyed = true;
     // cleanup must be run before onSubmit otherwise when app blurs the wysiwyg
     // it'd get stuck in an infinite loop of blur→onSubmit after we re-focus the
     // wysiwyg on update
-    cleanup();
+    discard();
     const updateElement = app.scene.getElement(
       element.id,
     ) as ExcalidrawTextElement;
@@ -1140,7 +1145,12 @@ export const textWysiwyg = ({
     ownerWindow.setTimeout(() => {
       // If we interacted within shape actions menu or its popovers/triggers,
       // keep submit disabled and don't steal focus back to textarea.
-      if (inShapeActionsMenu || isPropertiesTrigger || isPropertiesContent) {
+      if (
+        isDestroyed ||
+        inShapeActionsMenu ||
+        isPropertiesTrigger ||
+        isPropertiesContent
+      ) {
         return;
       }
 
@@ -1322,12 +1332,14 @@ export const textWysiwyg = ({
   // rAF (+ capture to by doubly sure) so we don't catch te pointerdown that
   // triggered the wysiwyg
   ownerWindow.requestAnimationFrame(() => {
-    ownerWindow.addEventListener("pointerdown", onPointerDown, {
-      capture: true,
-    });
+    if (!isDestroyed) {
+      ownerWindow.addEventListener("pointerdown", onPointerDown, {
+        capture: true,
+      });
+    }
   });
   ownerWindow.addEventListener("beforeunload", handleSubmit);
   editorBox!.appendChild(editable);
 
-  return handleSubmit;
+  return { submit: handleSubmit, discard };
 };

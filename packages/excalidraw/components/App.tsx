@@ -450,6 +450,7 @@ import type {
   BinaryFileData,
   ExcalidrawImperativeAPI,
   BinaryFiles,
+  ObservedAppState,
   Gesture,
   GestureEvent,
   LibraryItems,
@@ -784,7 +785,7 @@ class App extends React.Component<AppProps, AppState> {
   /** offsets of `elementRenderOverrides`; keeps its identity while they don't change */
   private elementRenderOffsets: ElementRenderOffsets = new Map();
   private renderOverridesUpdatePending = false;
-  private captureAppStateOnlyOnCommit = false;
+  private appStateOnlyCaptureKeys = new Set<keyof ObservedAppState>();
 
   private getRenderOverrideConfig = () => ({
     elementRenderOverrides: this.elementRenderOverrides,
@@ -3158,6 +3159,34 @@ class App extends React.Component<AppProps, AppState> {
     const isEditingNewShapeLabel =
       currentEditingText &&
       this.text.isEditingNewShapeLabel(currentEditingText.id);
+    // Open File returns a file map even when no files need replacing.
+    const replacingScene =
+      !!actionResult.elements &&
+      actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY &&
+      (actionResult.replaceFiles || !!actionResult.files);
+    const discardingShapeLabel = isEditingNewShapeLabel && replacingScene;
+    if (discardingShapeLabel) {
+      this.text.discardNewShapeLabel();
+    }
+
+    let actionAppState: Partial<AppState> = discardingShapeLabel
+      ? { ...actionResult.appState, newElement: null }
+      : actionResult.appState || {};
+    let editingTextElement = discardingShapeLabel
+      ? null
+      : actionAppState.editingTextElement || null;
+    if (actionResult.elements && editingTextElement) {
+      const editingTextElementId = editingTextElement.id;
+      const nextElement = actionResult.elements.find(
+        (element) => element.id === editingTextElementId,
+      );
+      editingTextElement =
+        nextElement &&
+        isNonDeletedElement(nextElement) &&
+        isTextElement(nextElement)
+          ? nextElement
+          : null;
+    }
 
     if (
       isEditingNewShapeLabel &&
@@ -3167,7 +3196,19 @@ class App extends React.Component<AppProps, AppState> {
       // Capture app state changes such as canvas background independently of
       // the draft label and its container resize.
       if (actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY) {
-        this.captureAppStateOnlyOnCommit ||= !!actionResult.appState;
+        const current = getObservedAppState(this.state);
+        const next = getObservedAppState({ ...this.state, ...actionAppState });
+        const changedKeys = new Set(Delta.getRightDifferences(current, next));
+        actionAppState = { ...actionAppState };
+        for (const key of Object.keys(current) as (keyof ObservedAppState)[]) {
+          if (changedKeys.has(key)) {
+            this.appStateOnlyCaptureKeys.add(key);
+          } else if (!this.appStateOnlyCaptureKeys.has(key)) {
+            // Actions often return a copy of the state they were given. Let
+            // unrelated fields keep their value from earlier queued updates.
+            delete actionAppState[key];
+          }
+        }
       } else {
         this.store.scheduleMicroAction({
           action: actionResult.captureUpdate,
@@ -3180,12 +3221,10 @@ class App extends React.Component<AppProps, AppState> {
     } else {
       // Leave property edits (including font preview resets) in the draft so
       // submit can capture the shape resize with the final label or its cleanup.
-      // A scene import can carry the same editing state from the old scene.
       const deferCapture =
         isEditingNewShapeLabel &&
         actionResult.elements &&
-        !actionResult.replaceFiles &&
-        actionResult.appState?.editingTextElement?.id === currentEditingText.id;
+        editingTextElement?.id === currentEditingText.id;
       this.store.scheduleAction(
         deferCapture
           ? CaptureUpdateAction.EVENTUALLY
@@ -3195,7 +3234,6 @@ class App extends React.Component<AppProps, AppState> {
 
     let didUpdate = false;
 
-    let editingTextElement: AppState["editingTextElement"] | null = null;
     if (actionResult.elements) {
       this.scene.replaceAllElements(actionResult.elements);
       didUpdate = true;
@@ -3206,12 +3244,15 @@ class App extends React.Component<AppProps, AppState> {
       this.addNewImagesToImageCache();
     }
 
-    if (actionResult.appState || editingTextElement || this.state.contextMenu) {
+    if (
+      actionResult.appState ||
+      discardingShapeLabel ||
+      this.state.contextMenu
+    ) {
       let viewModeEnabled = actionResult?.appState?.viewModeEnabled || false;
       let zenModeEnabled = actionResult?.appState?.zenModeEnabled || false;
       const theme =
         actionResult?.appState?.theme || this.props.theme || THEME.LIGHT;
-      const name = actionResult?.appState?.name ?? this.state.name;
       const errorMessage =
         actionResult?.appState?.errorMessage ?? this.state.errorMessage;
       if (typeof this.props.viewModeEnabled !== "undefined") {
@@ -3228,25 +3269,7 @@ class App extends React.Component<AppProps, AppState> {
         zenModeEnabled = this.props.zenModeEnabled;
       }
 
-      editingTextElement = actionResult.appState?.editingTextElement || null;
-
-      // make sure editingTextElement points to latest element reference
-      if (actionResult.elements && editingTextElement) {
-        const editingTextElementId = editingTextElement.id;
-        const nextElement = actionResult.elements.find(
-          (element) => element.id === editingTextElementId,
-        );
-        editingTextElement =
-          nextElement &&
-          isNonDeletedElement(nextElement) &&
-          isTextElement(nextElement)
-            ? nextElement
-            : null;
-      }
-
       this.setState((prevAppState) => {
-        const actionAppState = actionResult.appState || {};
-
         return {
           ...prevAppState,
           ...actionAppState,
@@ -3258,7 +3281,7 @@ class App extends React.Component<AppProps, AppState> {
           viewModeEnabled,
           zenModeEnabled,
           theme,
-          name,
+          name: actionAppState.name ?? prevAppState.name,
           errorMessage,
         };
       });
@@ -4556,16 +4579,21 @@ class App extends React.Component<AppProps, AppState> {
       this.setState({ scrolledOutside });
     }
 
-    if (this.captureAppStateOnlyOnCommit) {
-      this.captureAppStateOnlyOnCommit = false;
-      // Use the committed app state so updates in the same React batch are
-      // recorded together, including when they cancel one another out.
+    if (this.appStateOnlyCaptureKeys.size) {
+      // Use the committed values for fields owned by these actions so updates
+      // in the same batch coalesce, including a change back to the old value.
       const action = CaptureUpdateAction.IMMEDIATELY;
       const previous = StoreSnapshot.create(
         StoreSnapshot.empty().elements,
         prevState,
       );
-      const next = previous.maybeClone(action, undefined, this.state);
+      const committed = getObservedAppState(this.state);
+      const captured = { ...previous.appState };
+      for (const key of this.appStateOnlyCaptureKeys) {
+        Object.assign(captured, { [key]: committed[key] });
+      }
+      this.appStateOnlyCaptureKeys.clear();
+      const next = previous.maybeClone(action, undefined, captured);
       if (next !== previous) {
         this.store.scheduleMicroAction({
           action,
@@ -4767,8 +4795,21 @@ class App extends React.Component<AppProps, AppState> {
           return element;
         }
 
+        const { deleted, inserted } = Delta.calculate(beforeSubmit, submitted);
+        Delta.diffArrays(deleted, inserted, "boundElements", ({ id }) => id);
+        const { boundElements, ...updates } = inserted;
         return newElementWith(element, {
-          ...Delta.calculate(beforeSubmit, submitted).inserted,
+          ...updates,
+          ...(boundElements?.length || deleted.boundElements?.length
+            ? {
+                boundElements: Delta.mergeArrays(
+                  element.boundElements,
+                  boundElements,
+                  deleted.boundElements,
+                  ({ id }) => id,
+                ),
+              }
+            : null),
           version: Math.max(element.version, submitted.version) + 1,
           versionNonce: undefined,
         });
@@ -5114,6 +5155,13 @@ class App extends React.Component<AppProps, AppState> {
       const { elements, appState, collaborators, captureUpdate } = sceneData;
 
       if (captureUpdate) {
+        if (captureUpdate === CaptureUpdateAction.NEVER && appState) {
+          for (const key of this.appStateOnlyCaptureKeys) {
+            if (Object.prototype.hasOwnProperty.call(appState, key)) {
+              this.appStateOnlyCaptureKeys.delete(key);
+            }
+          }
+        }
         const nextElements = elements ? elements : undefined;
         const observedAppState = appState
           ? getObservedAppState({

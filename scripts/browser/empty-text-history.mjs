@@ -1,26 +1,44 @@
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
-import { chromium } from "playwright";
 
 const output = process.env.ARTIFACT_DIR || "test-results/empty-text-history";
-await mkdir(output, { recursive: true });
-const browser = await chromium.launch();
+let browser;
+try {
+  await mkdir(output, { recursive: true });
+  const { chromium } = await import("playwright");
+  browser = await chromium.launch();
+} catch (error) {
+  console.error("Could not start the Chromium check", error);
+  process.exit(2);
+}
+
 const failures = [];
+let environmentError;
+const recordEnvironmentError = (error) => {
+  environmentError ??= String(error);
+  console.error("Browser check environment error", error);
+};
+
 let checks = 0;
 try {
   for (const type of ["rectangle", "ellipse", "diamond"]) {
-    const context = await browser.newContext({
-      viewport: { width: 1200, height: 800 },
-    });
-    const page = await context.newPage();
-    const read = () =>
-      page.evaluate(() =>
-        JSON.parse(localStorage.getItem("excalidraw") || "[]"),
-      );
+    let context;
+    let page;
+    let navigating = false;
     try {
+      context = await browser.newContext({
+        viewport: { width: 1200, height: 800 },
+      });
+      page = await context.newPage();
+      const read = () =>
+        page.evaluate(() =>
+          JSON.parse(localStorage.getItem("excalidraw") || "[]"),
+        );
+      navigating = true;
       await page.goto(process.env.BASE_URL || "http://127.0.0.1:5176", {
         waitUntil: "domcontentloaded",
       });
+      navigating = false;
       await page.locator("canvas").first().waitFor();
       await page.getByTestId(`toolbar-${type}`).click();
       await page.mouse.move(600, 300);
@@ -71,20 +89,37 @@ try {
       await writeFile(
         `${output}/${type}.json`,
         JSON.stringify({ original, resized, afterUndo, afterRedo }, null, 2),
-      );
+      ).catch(recordEnvironmentError);
     } catch (error) {
-      failures.push({ type, error: String(error) });
-      await page.screenshot({ path: `${output}/${type}-failure.png` });
+      const previewUnavailable =
+        navigating &&
+        /net::ERR_(CONNECTION_REFUSED|CONNECTION_RESET|CONNECTION_CLOSED|EMPTY_RESPONSE|TIMED_OUT)\b/.test(
+          String(error),
+        );
+      if (
+        !(error instanceof assert.AssertionError) &&
+        (!page || !browser.isConnected() || previewUnavailable)
+      ) {
+        recordEnvironmentError(error);
+      } else {
+        failures.push({ type, error: String(error) });
+        await page
+          ?.screenshot({ path: `${output}/${type}-failure.png` })
+          .catch(recordEnvironmentError);
+      }
     } finally {
-      await context.close();
+      await context?.close().catch(recordEnvironmentError);
+    }
+    if (environmentError) {
+      break;
     }
   }
 } finally {
-  await browser.close();
+  await browser.close().catch(recordEnvironmentError);
 }
-await writeFile(
-  `${output}/result.json`,
-  JSON.stringify({ checks, failures }, null, 2),
+const result = { checks, failures, environmentError };
+await writeFile(`${output}/result.json`, JSON.stringify(result, null, 2)).catch(
+  recordEnvironmentError,
 );
-console.log(JSON.stringify({ checks, failures }));
-if (failures.length) process.exitCode = 1;
+console.log(JSON.stringify({ ...result, environmentError }));
+process.exitCode = failures.length ? 1 : environmentError ? 2 : 0;

@@ -83,11 +83,23 @@ type AppTextDependencies = {
 export class AppText {
   constructor(private app: App, private dependencies: AppTextDependencies) {}
 
-  public textWysiwygSubmitHandler: ReturnType<typeof textWysiwyg> | null = null;
+  private textEditor: ReturnType<typeof textWysiwyg> | null = null;
   private newShapeLabelId: string | null = null;
+
+  public get textWysiwygSubmitHandler() {
+    return this.textEditor?.submit ?? null;
+  }
 
   public isEditingNewShapeLabel(elementId: string) {
     return this.newShapeLabelId === elementId;
+  }
+
+  public discardNewShapeLabel() {
+    if (this.newShapeLabelId) {
+      this.textEditor?.discard();
+      this.textEditor = null;
+      this.newShapeLabelId = null;
+    }
   }
 
   private getTextCreationGridPoint = (x: number, y: number) => {
@@ -296,7 +308,7 @@ export class AppText {
         ? element.id
         : null;
 
-    this.textWysiwygSubmitHandler = textWysiwyg({
+    this.textEditor = textWysiwyg({
       canvas: this.app.canvas,
       getViewportCoords: (x, y) => {
         const { x: viewportX, y: viewportY } = sceneCoordsToViewportCoords(
@@ -320,7 +332,7 @@ export class AppText {
         }
       }),
       onSubmit: withBatchedUpdates(({ viaKeyboard, nextOriginalText }) => {
-        this.textWysiwygSubmitHandler = null;
+        this.textEditor = null;
         this.newShapeLabelId = null;
 
         const isDeleted = !nextOriginalText.trim();

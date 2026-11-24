@@ -18,6 +18,8 @@ jobs:
         with:
           node-version: 22
           cache: yarn
+      - name: Verify browser check exit protocol
+        run: python3 -m unittest discover -s scripts/browser -p test_empty_text_production.py -v
       - run: yarn install --frozen-lockfile
       - run: yarn playwright install --with-deps chromium
       - name: Verify production empty text history

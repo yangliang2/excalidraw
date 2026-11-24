@@ -117,6 +117,7 @@ import {
   newImageElement,
   newLinearElement,
   deepCopyElement,
+  Delta,
   duplicateElements,
   hasBoundTextElement,
   isArrowElement,
@@ -3179,9 +3180,11 @@ class App extends React.Component<AppProps, AppState> {
     } else {
       // Leave property edits (including font preview resets) in the draft so
       // submit can capture the shape resize with the final label or its cleanup.
+      // A scene import can carry the same editing state from the old scene.
       const deferCapture =
         isEditingNewShapeLabel &&
         actionResult.elements &&
+        !actionResult.replaceFiles &&
         actionResult.appState?.editingTextElement?.id === currentEditingText.id;
       this.store.scheduleAction(
         deferCapture
@@ -4703,16 +4706,6 @@ class App extends React.Component<AppProps, AppState> {
     const elements = restoreElements(opts.elements, null, {
       deleteInvisibleElements: true,
     });
-    const { editingTextElement } = this.state;
-    if (
-      editingTextElement &&
-      this.text.isEditingNewShapeLabel(editingTextElement.id)
-    ) {
-      // Insertion selects new elements. Submit the label before taking the
-      // scene used for insertion so its resize and cleanup have their own undo.
-      this.text.textWysiwygSubmitHandler?.();
-    }
-
     const clientX =
       typeof opts.position === "object"
         ? opts.position.clientX
@@ -4739,7 +4732,48 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    const { nextElements, duplicatedElements } = duplication;
+    const { duplicatedElements } = duplication;
+    let { nextElements } = duplication;
+    const { editingTextElement } = this.state;
+    const submitText = this.text.textWysiwygSubmitHandler;
+    if (
+      submitText &&
+      editingTextElement &&
+      this.text.isEditingNewShapeLabel(editingTextElement.id)
+    ) {
+      // Submit only after the host accepts insertion. Keep the approved order
+      // and incorporate submission changes into any existing elements that
+      // the host returned as new objects.
+      const replacedElements = new Map<string, ExcalidrawElement>();
+      for (const element of nextElements) {
+        const current = this.scene.getElement(element.id);
+        if (current && current !== element) {
+          replacedElements.set(element.id, { ...current });
+        }
+      }
+
+      submitText();
+      nextElements = nextElements.map((element) => {
+        const submitted = this.scene.getElement(element.id);
+        if (!submitted || submitted === element) {
+          return element;
+        }
+
+        const beforeSubmit = replacedElements.get(element.id);
+        if (!beforeSubmit) {
+          return submitted;
+        }
+        if (beforeSubmit.version === submitted.version) {
+          return element;
+        }
+
+        return newElementWith(element, {
+          ...Delta.calculate(beforeSubmit, submitted).inserted,
+          version: Math.max(element.version, submitted.version) + 1,
+          versionNonce: undefined,
+        });
+      });
+    }
 
     this.scene.replaceAllElements(nextElements);
 

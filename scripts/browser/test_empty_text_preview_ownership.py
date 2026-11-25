@@ -26,7 +26,8 @@ class PreviewOwnershipTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        with tempfile.TemporaryDirectory() as output, +                ThreadingHTTPServer(('127.0.0.1', 0), Preview) as server:
+        with tempfile.TemporaryDirectory() as output, \
+                ThreadingHTTPServer(('127.0.0.1', 0), Preview) as server:
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             loader = Path(output, 'loader.mjs')

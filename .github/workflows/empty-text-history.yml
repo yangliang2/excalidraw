@@ -21,7 +21,12 @@ jobs:
           node-version: 22
           cache: yarn
       - name: Verify browser check exit protocol
-        run: python3 -m unittest discover -s scripts/browser -p 'test_empty_text*.py' -v
+        id: protocol
+        run: |
+          code=0
+          python3 -m unittest discover -s scripts/browser -p 'test_empty_text*.py' -v || code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
       - run: yarn install --frozen-lockfile
       - run: yarn playwright install --with-deps chromium
       - name: Verify production empty text history
@@ -31,6 +36,9 @@ jobs:
           python3 scripts/browser/check-empty-text-production.py || code=$?
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
+      - name: Classify browser check protocol failure
+        if: failure() && steps.protocol.outputs.exit_code == '1'
+        run: echo "Browser check exit protocol tests failed"
       - name: Classify production browser product failure
         if: failure() && steps.production.outputs.exit_code == '1'
         run: echo "Production browser check failed its build or behavior assertions"

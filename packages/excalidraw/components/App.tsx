@@ -493,8 +493,7 @@ type DraftSceneCapture = {
   labelId: string | undefined;
   updates: Partial<Pick<AppState, keyof ObservedAppState>>;
   queue: DraftSceneUpdate[];
-  pendingFields: Map<keyof ObservedAppState, DraftSceneUpdate>;
-  latestNever: Map<keyof ObservedAppState, number>;
+  pendingCanvasFields: Map<keyof ObservedAppState, DraftSceneUpdate>;
 };
 
 const isUIConfig = (ui: AppProps["ui"]): ui is UIConfig =>
@@ -3204,8 +3203,7 @@ class App extends React.Component<AppProps, AppState> {
       labelId: this.getNewShapeLabelId(),
       updates: {},
       queue: [],
-      pendingFields: new Map(),
-      latestNever: new Map(),
+      pendingCanvasFields: new Map(),
     });
     for (const key of keys) {
       Object.assign(capture.updates, { [key]: state[key] });
@@ -3270,21 +3268,12 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     for (const key of keys) {
-      if (action === CaptureUpdateAction.IMMEDIATELY) {
-        // Supersede any pending canvas edit to fields this capture writes.
-        // Only canvas edits can be superseded by a later immediate capture.
-        const pending = capture.pendingFields.get(key);
-        if (pending) {
-          delete pending.change.appState[key];
-        }
-        if (coalescible) {
-          capture.pendingFields.set(key, update);
-        } else {
-          capture.pendingFields.delete(key);
-        }
-      } else if (action === CaptureUpdateAction.NEVER) {
-        capture.pendingFields.delete(key);
-        capture.latestNever.set(key, capture.queue.length);
+      if (coalescible) {
+        capture.pendingCanvasFields.set(key, update);
+        continue;
+      }
+      if (action !== CaptureUpdateAction.EVENTUALLY) {
+        capture.pendingCanvasFields.delete(key);
       }
       Object.assign(update.change.appState, { [key]: observed[key] });
     }
@@ -3296,15 +3285,21 @@ class App extends React.Component<AppProps, AppState> {
 
   private scheduleDraftSceneUpdates(capture: DraftSceneCapture) {
     let committed = this.store.snapshot;
-    for (const [index, update] of capture.queue.entries()) {
-      const { action, change, elementPatches, previousAppState } = update;
-      const appState = { ...change.appState };
-      if (update.coalescible) {
-        // A canvas action captures the final value of the batch. An explicit
-        // API capture keeps its own entry even if a later NEVER writes it.
-        for (const [key, neverIndex] of capture.latestNever) {
-          if (index < neverIndex) {
-            delete appState[key];
+    const finalAppState = getObservedAppState(this.state);
+    const { labelId } = capture;
+    const draftLabelId =
+      labelId && !committed.elements.has(labelId) ? labelId : undefined;
+    for (const update of capture.queue) {
+      const { action, change, coalescible, elementPatches, previousAppState } =
+        update;
+      let appState = change.appState;
+      if (coalescible) {
+        // Canvas actions capture the batch's final value, including transient
+        // API writes. Explicit captures and NEVER own the fields they write.
+        appState = {};
+        for (const [key, pending] of capture.pendingCanvasFields) {
+          if (pending === update) {
+            Object.assign(appState, { [key]: finalAppState[key] });
           }
         }
       }
@@ -3315,19 +3310,39 @@ class App extends React.Component<AppProps, AppState> {
           elements[id] = element;
           continue;
         }
-        const before = committed.elements.get(id);
-        if (!before && id === capture.labelId) {
+        if (id === draftLabelId) {
           continue;
         }
+        const before = committed.elements.get(id);
         const patch = elementPatches.get(id);
         // Advance only by the versions introduced by this call. Any versions
         // already added by the draft must still be visible to the next capture.
-        elements[id] =
+        const nextElement =
           before && patch
             ? Object.assign({}, before, patch.fields, {
                 version: before.version + patch.versionIncrement,
               })
             : element;
+        const { boundElements } = nextElement;
+        if (
+          draftLabelId &&
+          boundElements?.some(({ id }) => id === draftLabelId)
+        ) {
+          // A changed binding list can still contain the draft label from the
+          // live scene. Publish the other bindings without the draft reference.
+          const bindings = boundElements.filter(
+            ({ id }) => id !== draftLabelId,
+          );
+          elements[id] = {
+            ...nextElement,
+            boundElements:
+              bindings.length === 0 && before?.boundElements === null
+                ? null
+                : bindings,
+          };
+        } else {
+          elements[id] = nextElement;
+        }
       }
 
       const previous = previousAppState

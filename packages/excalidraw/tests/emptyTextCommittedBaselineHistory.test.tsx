@@ -1,5 +1,6 @@
 import {
   CaptureUpdateAction,
+  StoreIncrement,
   newElementWith,
   type CaptureUpdateActionType,
 } from "@excalidraw/element";
@@ -7,8 +8,9 @@ import {
 import { actionChangeViewBackgroundColor } from "../actions/actionCanvas";
 import { Excalidraw } from "../index";
 
+import { API } from "./helpers/api";
 import { Keyboard, Pointer, UI } from "./helpers/ui";
-import { getTextEditor } from "./queries/dom";
+import { getTextEditor, updateTextEditor } from "./queries/dom";
 import { act, render } from "./test-utils";
 
 const { h } = window;
@@ -116,6 +118,34 @@ describe.each([false, true])(
       expectScene(blue);
     });
 
+    it.each([CaptureUpdateAction.EVENTUALLY, undefined])(
+      "redoes the final canvas color after a same-batch API update with capture mode %s",
+      async (captureUpdate) => {
+        const { editor, expectScene, originalColor } = await openEmptyLabel();
+        const undoDepth = h.history.undoStack.length;
+        act(() => {
+          h.app.actionManager.executeAction(
+            actionChangeViewBackgroundColor,
+            "api",
+            { viewBackgroundColor: red },
+          );
+          h.app.updateScene({
+            appState: { viewBackgroundColor: blue },
+            captureUpdate,
+          });
+        });
+        expect(h.state.viewBackgroundColor).toBe(blue);
+        expect(h.store.snapshot.appState.viewBackgroundColor).toBe(blue);
+        Keyboard.exitTextEditor(editor);
+        expect(h.history.undoStack).toHaveLength(undoDepth + 1);
+        expectScene(blue);
+        Keyboard.undo();
+        expectScene(originalColor);
+        Keyboard.redo();
+        expectScene(blue);
+      },
+    );
+
     it("keeps draft geometry out of an explicit mixed scene capture", async () => {
       const { container, editor, expectScene, originalColor } =
         await openEmptyLabel(10);
@@ -154,5 +184,95 @@ describe.each([false, true])(
       Keyboard.redo();
       expectScene(blue, { width, height });
     });
+  },
+);
+
+it.each(["", "Draft label"])(
+  "publishes an arrow binding independently of the draft label %j",
+  async (input) => {
+    const onIncrement = vi.fn<(increment: StoreIncrement) => void>();
+    await render(
+      <Excalidraw handleKeyboardGlobally onIncrement={onIncrement} />,
+    );
+    const { container, editor } = await openEmptyLabel(10);
+    if (input) {
+      updateTextEditor(editor, input);
+    }
+    const labelId = h.state.editingTextElement!.id;
+    const draftBinding = { type: "text", id: labelId } as const;
+    const arrow = API.createElement({
+      type: "arrow",
+      x: 300,
+      y: 300,
+      endBinding: {
+        elementId: container.id,
+        mode: "inside",
+        fixedPoint: [0.5, 0.8],
+      },
+    });
+    const arrowBinding = { type: "arrow", id: arrow.id } as const;
+    const liveContainer = () => h.app.scene.getNonDeletedElement(container.id);
+    expect(liveContainer()?.boundElements).toContainEqual(draftBinding);
+    onIncrement.mockClear();
+
+    act(() => {
+      h.app.updateScene({
+        elements: [
+          ...h.app.scene.getElementsIncludingDeleted().map((element) =>
+            element.id === container.id
+              ? newElementWith(element, {
+                  boundElements: [
+                    ...(element.boundElements ?? []),
+                    arrowBinding,
+                  ],
+                })
+              : element,
+          ),
+          arrow,
+        ],
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+      });
+    });
+
+    const durable = onIncrement.mock.calls
+      .map(([increment]) => increment)
+      .filter(StoreIncrement.isDurable);
+    expect(durable).toHaveLength(1);
+    const { elements } = durable[0].change;
+    expect(elements[container.id].boundElements).toEqual([arrowBinding]);
+    expect(elements[arrow.id]).toMatchObject({
+      endBinding: { elementId: container.id },
+    });
+    expect(elements[labelId]).toBeUndefined();
+    expect(h.store.snapshot.elements.get(container.id)?.boundElements).toEqual([
+      arrowBinding,
+    ]);
+    expect(liveContainer()?.boundElements).toEqual([
+      draftBinding,
+      arrowBinding,
+    ]);
+
+    Keyboard.exitTextEditor(editor);
+    const submittedBindings = input
+      ? [draftBinding, arrowBinding]
+      : [arrowBinding];
+    expect(liveContainer()?.boundElements).toEqual(submittedBindings);
+    expect(h.store.snapshot.elements.get(container.id)?.boundElements).toEqual(
+      submittedBindings,
+    );
+    Keyboard.undo();
+    expect(liveContainer()).toMatchObject({
+      width: 10,
+      height: 10,
+      boundElements: [arrowBinding],
+    });
+    expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
+    Keyboard.redo();
+    expect(liveContainer()?.boundElements).toHaveLength(
+      submittedBindings.length,
+    );
+    expect(liveContainer()?.boundElements).toEqual(
+      expect.arrayContaining(submittedBindings),
+    );
   },
 );

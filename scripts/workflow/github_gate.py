@@ -17,6 +17,8 @@ PRODUCTION_PATH = '.github/workflows/empty-text-history.yml'
 PRODUCT_CLASSIFIER = 'Classify production browser product failure'
 ENVIRONMENT_CLASSIFIER = 'Classify production browser environment failure'
 BROWSER_STEP = 'Verify production empty text history'
+PROTOCOL_STEP = 'Verify browser check exit protocol'
+PROTOCOL_CLASSIFIER = 'Classify browser check protocol failure'
 PENDING = {'IN_PROGRESS', 'QUEUED', 'PENDING', 'EXPECTED', 'REQUESTED', 'WAITING'}
 
 
@@ -134,9 +136,16 @@ def classify_production_check(items, head, base, repo, pr, api):
     evidence(all(record['head_sha'] in (head, sha) for record in (run, job, check)),
              'production workflow, job or check ran for a different revision')
 
+    protocol = completed_step(steps, PROTOCOL_STEP)
+    protocol_failure = completed_step(steps, PROTOCOL_CLASSIFIER)
     browser = completed_step(steps, BROWSER_STEP)
     product = completed_step(steps, PRODUCT_CLASSIFIER)
     environment = completed_step(steps, ENVIRONMENT_CLASSIFIER)
+    if (conclusion == 'FAILURE' and (protocol, protocol_failure) == ('failure', 'success')
+            and (browser, product, environment) == ('skipped', 'skipped', 'skipped')):
+        return 'rework', 'browser check exit protocol tests failed'
+    if (protocol, protocol_failure) != ('success', 'skipped'):
+        return 'environment-error', 'browser check exit protocol classification is missing or inconsistent'
     if conclusion == 'SUCCESS' and (browser, product, environment) == ('success', 'skipped', 'skipped'):
         return 'passed', None
     if conclusion == 'FAILURE' and browser == 'failure':

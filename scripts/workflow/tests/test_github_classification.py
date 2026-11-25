@@ -19,6 +19,8 @@ WORKFLOW = 'Empty text history acceptance'
 CHECK = 'empty-text-history'
 PRODUCT = 'Classify production browser product failure'
 ENVIRONMENT = 'Classify production browser environment failure'
+PROTOCOL = 'Verify browser check exit protocol'
+PROTOCOL_FAILURE = 'Classify browser check protocol failure'
 RUN_PATH = f'repos/{REPO}/actions/runs/101'
 JOBS_PATH = RUN_PATH + '/attempts/2/jobs?per_page=100'
 CHECK_PATH = f'repos/{REPO}/check-runs/501'
@@ -52,6 +54,8 @@ class GitHubClassificationTests(unittest.TestCase):
             step('Verify production empty text history', 'failure'),
             step(PRODUCT, 'success'),
             step(ENVIRONMENT, 'skipped'),
+            step(PROTOCOL, 'success'),
+            step(PROTOCOL_FAILURE, 'skipped'),
         ]
         self.job = {
             'id': 201, 'name': CHECK, 'run_id': 101, 'run_attempt': 2,
@@ -91,10 +95,40 @@ class GitHubClassificationTests(unittest.TestCase):
         self.assertEqual(result['status'], 'environment-error')
         self.assertFalse(result['retryable'])
 
+    def test_protocol_failure_is_rework_when_production_is_skipped(self):
+        self.steps[1:] = [
+            step(PROTOCOL, 'failure'),
+            step('Verify production empty text history', 'skipped'),
+            step(PROTOCOL_FAILURE, 'success'),
+            step(PRODUCT, 'skipped'),
+            step(ENVIRONMENT, 'skipped'),
+        ]
+        result = self.verdict()
+        self.assertEqual(result['status'], 'rework')
+        self.assertEqual(
+            result['not_successful'][0]['reason'],
+            'browser check exit protocol tests failed',
+        )
+
+        self.steps[2]['conclusion'] = 'failure'
+        self.assertEqual(self.verdict()['status'], 'environment-error')
+        self.steps[2]['conclusion'] = 'skipped'
+        self.steps[3]['conclusion'] = 'skipped'
+        self.assertEqual(self.verdict()['status'], 'environment-error')
+
+    def test_skipped_protocol_cannot_pass(self):
+        self.item['conclusion'] = 'SUCCESS'
+        for record in (self.run, self.job, self.check):
+            record['conclusion'] = 'success'
+        self.steps[1]['conclusion'] = 'success'
+        self.steps[2]['conclusion'] = 'skipped'
+        self.steps[4]['conclusion'] = 'skipped'
+        self.assertEqual(self.verdict()['status'], 'environment-error')
+
     def test_missing_or_conflicting_classifier_is_environment_error(self):
         self.steps[3]['conclusion'] = 'success'
         self.assertEqual(self.verdict()['status'], 'environment-error')
-        del self.steps[2:]
+        del self.steps[2:4]
         self.assertEqual(self.verdict()['status'], 'environment-error')
 
     def test_unbound_metadata_is_environment_error(self):

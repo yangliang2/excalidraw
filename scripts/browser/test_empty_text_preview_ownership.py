@@ -1,5 +1,7 @@
 """Simulated preview services exercising the Node guard without Chromium."""
+import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -7,11 +9,44 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 
 CHECKER = Path(__file__).with_name('empty-text-history.mjs')
 MARKER = 'preview-marker.txt'
 TOKEN = 'fixture-preview-token'
+
+
+class ProtocolEnvironmentError(Exception):
+    """The runner could not provide a resource needed by a protocol test."""
+
+
+def environment_call(operation, function, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProtocolEnvironmentError(f'{operation}: {error}') from error
+
+
+class ProtocolTestResult(unittest.TextTestResult):
+    environment_failed = False
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self.record_environment_error(err)
+
+    def addSubTest(self, test, subtest, err):
+        super().addSubTest(test, subtest, err)
+        self.record_environment_error(err)
+
+    def record_environment_error(self, err):
+        if err is not None and isinstance(err[1], ProtocolEnvironmentError):
+            self.environment_failed = True
+
+    def exit_code(self):
+        if self.environment_failed:
+            return 2
+        return 0 if self.wasSuccessful() else 1
 
 
 class PreviewOwnershipTests(unittest.TestCase):
@@ -26,12 +61,13 @@ class PreviewOwnershipTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        with tempfile.TemporaryDirectory() as output, \
-                ThreadingHTTPServer(('127.0.0.1', 0), Preview) as server:
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+        with environment_call(
+            'create preview fixture directory', tempfile.TemporaryDirectory,
+        ) as output, environment_call(
+            'listen for preview fixture', ThreadingHTTPServer, ('127.0.0.1', 0), Preview,
+        ) as server:
             loader = Path(output, 'loader.mjs')
-            loader.write_text("""
+            environment_call('write preview fixture loader', loader.write_text, """
 import { writeFileSync } from 'node:fs';
 export function resolve(specifier, context, nextResolve) {
   if (specifier === 'playwright') {
@@ -42,8 +78,11 @@ export function resolve(specifier, context, nextResolve) {
 }
 """)
             sentinel = Path(output, 'playwright-imported')
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
             try:
-                result = subprocess.run(
+                result = environment_call(
+                    'run Node preview checker', subprocess.run,
                     ['node', '--experimental-loader', str(loader), str(CHECKER)],
                     env={
                         **os.environ,
@@ -94,8 +133,10 @@ export function resolve(specifier, context, nextResolve) {
         self.assertEqual(paths, ['/' + MARKER])
 
     def test_absent_preview_process_does_not_probe_or_import_playwright(self):
-        with subprocess.Popen([sys.executable, '-c', 'pass']) as preview:
-            preview.wait(timeout=5)
+        with environment_call(
+            'start preview fixture process', subprocess.Popen, [sys.executable, '-c', 'pass'],
+        ) as preview:
+            environment_call('wait for preview fixture process', preview.wait, timeout=5)
             result, imported, paths = self.run_checker(
                 self.reply(TOKEN), pid=preview.pid,
             )
@@ -114,3 +155,45 @@ export function resolve(specifier, context, nextResolve) {
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(imported)
         self.assertEqual(paths, ['/' + MARKER])
+
+
+class ProtocolClassificationTests(unittest.TestCase):
+    def test_fixture_resource_errors_in_tests_and_subtests_exit_two(self):
+        for name, error, method in (
+            ('ThreadingHTTPServer', OSError(errno.EMFILE, 'simulated socket failure'),
+             'test_foreign_http_200_never_imports_playwright'),
+            ('tempfile.TemporaryDirectory', PermissionError('simulated temp failure'),
+             'test_redirect_to_matching_body_is_rejected'),
+            ('subprocess.run', FileNotFoundError('simulated Node startup failure'),
+             'test_matching_body_allows_playwright_import_for_live_process'),
+        ):
+            with self.subTest(resource=name), patch(f'{__name__}.{name}', side_effect=error):
+                result = unittest.TextTestRunner(
+                    stream=io.StringIO(), resultclass=ProtocolTestResult,
+                ).run(PreviewOwnershipTests(method))
+                self.assertEqual(result.exit_code(), 2)
+
+    def test_fixture_assertion_and_programming_errors_exit_one(self):
+        for error in (AssertionError('simulated failed assertion'),
+                      TypeError('simulated unary plus on fixture server')):
+            with self.subTest(error=type(error)), patch(
+                f'{__name__}.ThreadingHTTPServer', side_effect=error,
+            ):
+                result = unittest.TextTestRunner(
+                    stream=io.StringIO(), resultclass=ProtocolTestResult,
+                ).run(PreviewOwnershipTests('test_foreign_http_200_never_imports_playwright'))
+                self.assertEqual(result.exit_code(), 1)
+
+
+def run_protocol_tests():
+    loader = unittest.TestLoader()
+    suite = loader.discover(
+        str(Path(__file__).resolve().parent), pattern='test_empty_text_production.py',
+    )
+    suite.addTests(loader.loadTestsFromModule(sys.modules[__name__]))
+    result = unittest.TextTestRunner(verbosity=2, resultclass=ProtocolTestResult).run(suite)
+    return result.exit_code()
+
+
+if __name__ == '__main__':
+    raise SystemExit(run_protocol_tests())

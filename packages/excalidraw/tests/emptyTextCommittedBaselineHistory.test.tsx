@@ -187,92 +187,159 @@ describe.each([false, true])(
   },
 );
 
-it.each(["", "Draft label"])(
-  "publishes an arrow binding independently of the draft label %j",
-  async (input) => {
-    const onIncrement = vi.fn<(increment: StoreIncrement) => void>();
-    await render(
-      <Excalidraw handleKeyboardGlobally onIncrement={onIncrement} />,
-    );
-    const { container, editor } = await openEmptyLabel(10);
-    if (input) {
-      updateTextEditor(editor, input);
-    }
-    const labelId = h.state.editingTextElement!.id;
-    const draftBinding = { type: "text", id: labelId } as const;
-    const arrow = API.createElement({
-      type: "arrow",
-      x: 300,
-      y: 300,
-      endBinding: {
-        elementId: container.id,
-        mode: "inside",
-        fixedPoint: [0.5, 0.8],
+describe.each([CaptureUpdateAction.IMMEDIATELY, CaptureUpdateAction.NEVER])(
+  "captures an arrow binding during a label draft with %s",
+  (captureUpdate) => {
+    describe.each([true, false])(
+      "with an increment subscriber: %s",
+      (subscribe) => {
+        it.each([
+          { input: "", exitInBatch: false },
+          { input: "Draft label", exitInBatch: false },
+          { input: "", exitInBatch: true },
+          { input: "Draft label", exitInBatch: true },
+        ])(
+          "restores geometry and bindings for $input with same-batch exit: $exitInBatch",
+          async ({ input, exitInBatch }) => {
+            const onIncrement = vi.fn<(increment: StoreIncrement) => void>();
+            await render(
+              <Excalidraw
+                handleKeyboardGlobally
+                onIncrement={subscribe ? onIncrement : undefined}
+              />,
+            );
+            const { container, editor } = await openEmptyLabel(10);
+            if (input) {
+              updateTextEditor(editor, input);
+            }
+            const labelId = h.state.editingTextElement!.id;
+            const draftBinding = { type: "text", id: labelId } as const;
+            const arrow = API.createElement({
+              type: "arrow",
+              x: 300,
+              y: 300,
+              endBinding: {
+                elementId: container.id,
+                mode: "inside",
+                fixedPoint: [0.5, 0.8],
+              },
+            });
+            const arrowBinding = { type: "arrow", id: arrow.id } as const;
+            const liveContainer = () =>
+              h.app.scene.getNonDeletedElement(container.id)!;
+            const committedContainer = () =>
+              h.store.snapshot.elements.get(container.id)!;
+            const originalGeometry = { width: 10, height: 10 };
+            const undoDepth = h.history.undoStack.length;
+            expect(liveContainer().boundElements).toContainEqual(draftBinding);
+            onIncrement.mockClear();
+
+            act(() => {
+              h.app.updateScene({
+                elements: [
+                  ...h.app.scene.getElementsIncludingDeleted().map((element) =>
+                    element.id === container.id
+                      ? newElementWith(element, {
+                          boundElements: [
+                            ...(element.boundElements ?? []),
+                            arrowBinding,
+                          ],
+                        })
+                      : element,
+                  ),
+                  arrow,
+                ],
+                captureUpdate,
+              });
+              if (exitInBatch) {
+                Keyboard.exitTextEditor(editor);
+              }
+            });
+
+            const durable = captureUpdate === CaptureUpdateAction.IMMEDIATELY;
+            if (subscribe) {
+              const [[increment]] = onIncrement.mock.calls;
+              expect(StoreIncrement.isDurable(increment)).toBe(durable);
+              const { elements } = increment.change;
+              expect(elements[container.id]).toMatchObject({
+                ...originalGeometry,
+                boundElements: [arrowBinding],
+              });
+              expect(elements[arrow.id]).toMatchObject({
+                endBinding: { elementId: container.id },
+              });
+              expect(elements[labelId]).toBeUndefined();
+            }
+
+            if (!exitInBatch) {
+              expect(h.history.undoStack).toHaveLength(
+                undoDepth + Number(durable),
+              );
+              expect(committedContainer()).toMatchObject({
+                ...originalGeometry,
+                boundElements: [arrowBinding],
+              });
+              expect(liveContainer().boundElements).toEqual([
+                draftBinding,
+                arrowBinding,
+              ]);
+              expect(committedContainer().version).toBeLessThan(
+                liveContainer().version,
+              );
+              expect(committedContainer().versionNonce).not.toBe(
+                liveContainer().versionNonce,
+              );
+              Keyboard.exitTextEditor(editor);
+            }
+
+            const { width, height } = liveContainer();
+            const submittedBindings = input
+              ? [draftBinding, arrowBinding]
+              : [arrowBinding];
+            expect({ width, height }).not.toEqual(originalGeometry);
+            expect(liveContainer().boundElements).toEqual(submittedBindings);
+            expect(committedContainer().boundElements).toEqual(
+              submittedBindings,
+            );
+            expect(h.history.undoStack).toHaveLength(
+              undoDepth + Number(durable) + 1,
+            );
+
+            Keyboard.undo();
+            expect(liveContainer()).toMatchObject({
+              ...originalGeometry,
+              boundElements: [arrowBinding],
+            });
+            expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
+            expect(h.app.scene.getNonDeletedElement(arrow.id)).toMatchObject({
+              endBinding: { elementId: container.id },
+            });
+            expect(h.history.undoStack).toHaveLength(
+              undoDepth + Number(durable),
+            );
+
+            Keyboard.redo();
+            expect(liveContainer()).toMatchObject({ width, height });
+            expect(liveContainer().boundElements).toHaveLength(
+              submittedBindings.length,
+            );
+            expect(liveContainer().boundElements).toEqual(
+              expect.arrayContaining(submittedBindings),
+            );
+            expect(h.app.scene.getNonDeletedElement(arrow.id)).toMatchObject({
+              endBinding: { elementId: container.id },
+            });
+            if (input) {
+              expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject({
+                originalText: input,
+                containerId: container.id,
+              });
+            } else {
+              expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
+            }
+          },
+        );
       },
-    });
-    const arrowBinding = { type: "arrow", id: arrow.id } as const;
-    const liveContainer = () => h.app.scene.getNonDeletedElement(container.id);
-    expect(liveContainer()?.boundElements).toContainEqual(draftBinding);
-    onIncrement.mockClear();
-
-    act(() => {
-      h.app.updateScene({
-        elements: [
-          ...h.app.scene.getElementsIncludingDeleted().map((element) =>
-            element.id === container.id
-              ? newElementWith(element, {
-                  boundElements: [
-                    ...(element.boundElements ?? []),
-                    arrowBinding,
-                  ],
-                })
-              : element,
-          ),
-          arrow,
-        ],
-        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
-      });
-    });
-
-    const durable = onIncrement.mock.calls
-      .map(([increment]) => increment)
-      .filter(StoreIncrement.isDurable);
-    expect(durable).toHaveLength(1);
-    const { elements } = durable[0].change;
-    expect(elements[container.id].boundElements).toEqual([arrowBinding]);
-    expect(elements[arrow.id]).toMatchObject({
-      endBinding: { elementId: container.id },
-    });
-    expect(elements[labelId]).toBeUndefined();
-    expect(h.store.snapshot.elements.get(container.id)?.boundElements).toEqual([
-      arrowBinding,
-    ]);
-    expect(liveContainer()?.boundElements).toEqual([
-      draftBinding,
-      arrowBinding,
-    ]);
-
-    Keyboard.exitTextEditor(editor);
-    const submittedBindings = input
-      ? [draftBinding, arrowBinding]
-      : [arrowBinding];
-    expect(liveContainer()?.boundElements).toEqual(submittedBindings);
-    expect(h.store.snapshot.elements.get(container.id)?.boundElements).toEqual(
-      submittedBindings,
-    );
-    Keyboard.undo();
-    expect(liveContainer()).toMatchObject({
-      width: 10,
-      height: 10,
-      boundElements: [arrowBinding],
-    });
-    expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
-    Keyboard.redo();
-    expect(liveContainer()?.boundElements).toHaveLength(
-      submittedBindings.length,
-    );
-    expect(liveContainer()?.boundElements).toEqual(
-      expect.arrayContaining(submittedBindings),
     );
   },
 );

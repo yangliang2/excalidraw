@@ -485,7 +485,11 @@ type DraftSceneUpdate = {
   previousAppState?: ObservedAppState;
   elementPatches: Map<
     string,
-    { fields: Partial<OrderedExcalidrawElement>; versionIncrement: number }
+    {
+      fields: ElementUpdate<OrderedExcalidrawElement>;
+      previousBindings: OrderedExcalidrawElement["boundElements"];
+      versionIncrement: number;
+    }
   >;
 };
 
@@ -495,6 +499,15 @@ type DraftSceneCapture = {
   queue: DraftSceneUpdate[];
   pendingCanvasFields: Map<keyof ObservedAppState, DraftSceneUpdate>;
 };
+
+const hasElementFieldChange = (previous: unknown, next: unknown) =>
+  previous !== next &&
+  (typeof previous !== "object" ||
+    typeof next !== "object" ||
+    JSON.stringify(previous) !== JSON.stringify(next));
+
+const isElementVersionField = (key: string) =>
+  key === "version" || key === "versionNonce" || key === "updated";
 
 const isUIConfig = (ui: AppProps["ui"]): ui is UIConfig =>
   typeof ui === "object" && ui !== null;
@@ -3230,24 +3243,26 @@ class App extends React.Component<AppProps, AppState> {
         if (!visible) {
           continue;
         }
-        const fields: Partial<OrderedExcalidrawElement> = {};
+        const fields: ElementUpdate<OrderedExcalidrawElement> = {};
         const incoming = normalized?.get(id) ?? element;
         for (const key of Delta.getDifferences(visible, incoming)) {
+          if (isElementVersionField(key)) {
+            continue;
+          }
           const prop = key as keyof OrderedExcalidrawElement;
-          const previousValue = visible[prop];
-          const nextValue = incoming[prop];
           // A host may clone the scene, including unchanged nested values
           // such as bindings that still belong to the draft.
-          if (
-            typeof previousValue !== "object" ||
-            typeof nextValue !== "object" ||
-            JSON.stringify(previousValue) !== JSON.stringify(nextValue)
-          ) {
+          if (hasElementFieldChange(visible[prop], incoming[prop])) {
             Object.assign(fields, { [prop]: element[prop] });
           }
         }
         elementPatches.set(id, {
           fields,
+          previousBindings:
+            fields.boundElements === undefined
+              ? null
+              : visible.boundElements?.map((binding) => ({ ...binding })) ??
+                null,
           versionIncrement: element.version - visible.version,
         });
       }
@@ -3315,33 +3330,69 @@ class App extends React.Component<AppProps, AppState> {
         }
         const before = committed.elements.get(id);
         const patch = elementPatches.get(id);
-        // Advance only by the versions introduced by this call. Any versions
-        // already added by the draft must still be visible to the next capture.
-        const nextElement =
-          before && patch
-            ? Object.assign({}, before, patch.fields, {
-                version: before.version + patch.versionIncrement,
-              })
-            : element;
-        const { boundElements } = nextElement;
-        if (
-          draftLabelId &&
-          boundElements?.some(({ id }) => id === draftLabelId)
-        ) {
-          // A changed binding list can still contain the draft label from the
-          // live scene. Publish the other bindings without the draft reference.
-          const bindings = boundElements.filter(
-            ({ id }) => id !== draftLabelId,
+        if (!before || !patch) {
+          const bindings = element.boundElements;
+          const filtered = bindings?.filter(({ id }) => id !== draftLabelId);
+          elements[id] =
+            filtered && filtered.length !== bindings?.length
+              ? newElementWith(element, {
+                  boundElements: filtered.length ? filtered : null,
+                  version: Math.max(
+                    element.version,
+                    (before?.version ?? 0) + 1,
+                  ),
+                })
+              : element;
+          continue;
+        }
+
+        const { boundElements, ...fields } = patch.fields;
+        const updates: ElementUpdate<OrderedExcalidrawElement> =
+          Object.fromEntries(
+            Object.entries(fields).filter(([key, value]) =>
+              hasElementFieldChange(before[key as keyof typeof before], value),
+            ),
           );
-          elements[id] = {
-            ...nextElement,
-            boundElements:
-              bindings.length === 0 && before?.boundElements === null
-                ? null
-                : bindings,
+        if (boundElements !== undefined) {
+          const keepCommittedBinding = ({ id }: { id: string }) =>
+            id !== draftLabelId;
+          const removed = {
+            boundElements: patch.previousBindings?.filter(keepCommittedBinding),
           };
-        } else {
-          elements[id] = nextElement;
+          const added = {
+            boundElements: boundElements?.filter(keepCommittedBinding),
+          };
+          Delta.diffArrays(removed, added, "boundElements", ({ id }) => id);
+          const bindings = Delta.mergeArrays(
+            before.boundElements,
+            added.boundElements,
+            removed.boundElements,
+            ({ id }) => id,
+          );
+          if (hasElementFieldChange(before.boundElements ?? [], bindings)) {
+            Object.assign(updates, { boundElements: bindings });
+          }
+        }
+        if (Object.keys(updates).length) {
+          // Advance only by this call's changes so the draft still has a
+          // newer version when it is submitted.
+          const version = before.version + patch.versionIncrement;
+          const projected = { ...before, ...updates };
+          const matchesIncoming =
+            version === element.version &&
+            !Delta.getDifferences(projected, element).some((key) => {
+              const prop = key as keyof OrderedExcalidrawElement;
+              return (
+                !isElementVersionField(key) &&
+                hasElementFieldChange(projected[prop], element[prop])
+              );
+            });
+
+          // Different versions of the content must not share a nonce or
+          // ElementsDelta can miss the pending changes on label submission.
+          elements[id] = matchesIncoming
+            ? element
+            : newElementWith(before, { ...updates, version });
         }
       }
 

@@ -19,6 +19,7 @@ ENVIRONMENT_CLASSIFIER = 'Classify production browser environment failure'
 BROWSER_STEP = 'Verify production empty text history'
 PROTOCOL_STEP = 'Verify browser check exit protocol'
 PROTOCOL_CLASSIFIER = 'Classify browser check protocol failure'
+PROTOCOL_ENVIRONMENT_CLASSIFIER = 'Classify browser check protocol environment failure'
 PENDING = {'IN_PROGRESS', 'QUEUED', 'PENDING', 'EXPECTED', 'REQUESTED', 'WAITING'}
 
 
@@ -138,13 +139,17 @@ def classify_production_check(items, head, base, repo, pr, api):
 
     protocol = completed_step(steps, PROTOCOL_STEP)
     protocol_failure = completed_step(steps, PROTOCOL_CLASSIFIER)
+    protocol_environment = completed_step(steps, PROTOCOL_ENVIRONMENT_CLASSIFIER)
     browser = completed_step(steps, BROWSER_STEP)
     product = completed_step(steps, PRODUCT_CLASSIFIER)
     environment = completed_step(steps, ENVIRONMENT_CLASSIFIER)
-    if (conclusion == 'FAILURE' and (protocol, protocol_failure) == ('failure', 'success')
+    if (conclusion == 'FAILURE' and protocol == 'failure'
             and (browser, product, environment) == ('skipped', 'skipped', 'skipped')):
-        return 'rework', 'browser check exit protocol tests failed'
-    if (protocol, protocol_failure) != ('success', 'skipped'):
+        if (protocol_failure, protocol_environment) == ('success', 'skipped'):
+            return 'rework', 'browser check exit protocol tests failed'
+        if (protocol_failure, protocol_environment) == ('skipped', 'success'):
+            return 'environment-error', 'browser check protocol environment failed; a new CI attempt is needed'
+    if (protocol, protocol_failure, protocol_environment) != ('success', 'skipped', 'skipped'):
         return 'environment-error', 'browser check exit protocol classification is missing or inconsistent'
     if conclusion == 'SUCCESS' and (browser, product, environment) == ('success', 'skipped', 'skipped'):
         return 'passed', None

@@ -21,6 +21,7 @@ PRODUCT = 'Classify production browser product failure'
 ENVIRONMENT = 'Classify production browser environment failure'
 PROTOCOL = 'Verify browser check exit protocol'
 PROTOCOL_FAILURE = 'Classify browser check protocol failure'
+PROTOCOL_ENVIRONMENT = 'Classify browser check protocol environment failure'
 RUN_PATH = f'repos/{REPO}/actions/runs/101'
 JOBS_PATH = RUN_PATH + '/attempts/2/jobs?per_page=100'
 CHECK_PATH = f'repos/{REPO}/check-runs/501'
@@ -56,6 +57,7 @@ class GitHubClassificationTests(unittest.TestCase):
             step(ENVIRONMENT, 'skipped'),
             step(PROTOCOL, 'success'),
             step(PROTOCOL_FAILURE, 'skipped'),
+            step(PROTOCOL_ENVIRONMENT, 'skipped'),
         ]
         self.job = {
             'id': 201, 'name': CHECK, 'run_id': 101, 'run_attempt': 2,
@@ -102,6 +104,7 @@ class GitHubClassificationTests(unittest.TestCase):
             step(PROTOCOL_FAILURE, 'success'),
             step(PRODUCT, 'skipped'),
             step(ENVIRONMENT, 'skipped'),
+            step(PROTOCOL_ENVIRONMENT, 'skipped'),
         ]
         result = self.verdict()
         self.assertEqual(result['status'], 'rework')
@@ -115,6 +118,29 @@ class GitHubClassificationTests(unittest.TestCase):
         self.steps[2]['conclusion'] = 'skipped'
         self.steps[3]['conclusion'] = 'skipped'
         self.assertEqual(self.verdict()['status'], 'environment-error')
+
+    def test_latest_protocol_environment_failure_is_terminal(self):
+        self.info['statusCheckRollup'].insert(0, {
+            **self.item, 'conclusion': 'SUCCESS',
+            'detailsUrl': f'https://github.com/{REPO}/actions/runs/100/job/200',
+        })
+        self.steps[1:] = [
+            step(PROTOCOL, 'failure'),
+            step(PROTOCOL_FAILURE, 'skipped'),
+            step(PROTOCOL_ENVIRONMENT, 'success'),
+            step('Verify production empty text history', 'skipped'),
+            step(PRODUCT, 'skipped'),
+            step(ENVIRONMENT, 'skipped'),
+        ]
+        result = self.verdict()
+        self.assertEqual(result['status'], 'environment-error')
+        self.assertFalse(result['retryable'])
+        self.assertIn('a new CI attempt is needed', result['not_successful'][0]['reason'])
+
+        self.steps[2]['conclusion'] = 'success'
+        result = self.verdict()
+        self.assertEqual(result['status'], 'environment-error')
+        self.assertIn('missing or inconsistent', result['not_successful'][0]['reason'])
 
     def test_skipped_protocol_cannot_pass(self):
         self.item['conclusion'] = 'SUCCESS'

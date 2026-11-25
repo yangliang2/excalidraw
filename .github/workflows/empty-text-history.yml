@@ -24,7 +24,7 @@ jobs:
         id: protocol
         run: |
           code=0
-          python3 -m unittest discover -s scripts/browser -p 'test_empty_text*.py' -v || code=$?
+          python3 scripts/browser/test_empty_text_preview_ownership.py || code=$?
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
       - run: yarn install --frozen-lockfile
@@ -39,6 +39,9 @@ jobs:
       - name: Classify browser check protocol failure
         if: failure() && steps.protocol.outputs.exit_code == '1'
         run: echo "Browser check exit protocol tests failed"
+      - name: Classify browser check protocol environment failure
+        if: failure() && steps.protocol.outputs.exit_code == '2'
+        run: echo "Browser check exit protocol tests reported an environment failure"
       - name: Classify production browser product failure
         if: failure() && steps.production.outputs.exit_code == '1'
         run: echo "Production browser check failed its build or behavior assertions"

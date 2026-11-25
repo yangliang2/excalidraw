@@ -1,0 +1,158 @@
+import {
+  CaptureUpdateAction,
+  newElementWith,
+  type CaptureUpdateActionType,
+} from "@excalidraw/element";
+
+import { actionChangeViewBackgroundColor } from "../actions/actionCanvas";
+import { Excalidraw } from "../index";
+
+import { Keyboard, Pointer, UI } from "./helpers/ui";
+import { getTextEditor } from "./queries/dom";
+import { act, render } from "./test-utils";
+
+const { h } = window;
+const red = "#ff0000";
+const blue = "#0000ff";
+
+const setBackground = (
+  viewBackgroundColor: string,
+  captureUpdate: CaptureUpdateActionType,
+) => h.app.updateScene({ appState: { viewBackgroundColor }, captureUpdate });
+
+const openEmptyLabel = async (size = 200) => {
+  const originalColor = h.state.viewBackgroundColor;
+  const container = UI.createElement("rectangle", {
+    x: 200,
+    y: 200,
+    width: size,
+    height: size,
+  });
+  new Pointer("mouse").doubleClickAt(200 + size / 2, 200 + size / 2);
+  const editor = await getTextEditor();
+  const expectScene = (
+    color: string,
+    geometry = { width: size, height: size },
+  ) => {
+    expect(h.state.viewBackgroundColor).toBe(color);
+    const live = h.app.scene.getNonDeletedElement(container.id);
+    expect(live).toMatchObject(geometry);
+    expect(live?.boundElements ?? []).toEqual([]);
+    expect(h.app.scene.getNonDeletedElements().map((el) => el.id)).toEqual([
+      container.id,
+    ]);
+  };
+  return { container, editor, expectScene, originalColor };
+};
+
+describe.each([false, true])(
+  "with an increment subscriber: %s",
+  (subscribe) => {
+    beforeEach(async () => {
+      await render(
+        <Excalidraw
+          handleKeyboardGlobally
+          onIncrement={subscribe ? vi.fn() : undefined}
+        />,
+      );
+    });
+
+    it("undoes an explicit update to the committed color across React batches", async () => {
+      const { editor, expectScene, originalColor } = await openEmptyLabel();
+      const undoDepth = h.history.undoStack.length;
+      act(() => setBackground(red, CaptureUpdateAction.EVENTUALLY));
+      expect(h.state.viewBackgroundColor).toBe(red);
+      expect(h.store.snapshot.appState.viewBackgroundColor).toBe(originalColor);
+
+      act(() => setBackground(blue, CaptureUpdateAction.IMMEDIATELY));
+      Keyboard.exitTextEditor(editor);
+      expect(h.history.undoStack).toHaveLength(undoDepth + 1);
+      expectScene(blue);
+      Keyboard.undo();
+      expectScene(originalColor);
+      expect(h.history.undoStack).toHaveLength(undoDepth);
+      Keyboard.redo();
+      expectScene(blue);
+    });
+
+    it("preserves an explicit capture before a same-batch NEVER and label exit", async () => {
+      const { editor, expectScene, originalColor } = await openEmptyLabel();
+      const undoDepth = h.history.undoStack.length;
+      act(() => {
+        setBackground(red, CaptureUpdateAction.IMMEDIATELY);
+        setBackground(blue, CaptureUpdateAction.NEVER);
+        Keyboard.exitTextEditor(editor);
+      });
+      expectScene(blue);
+      expect(h.store.snapshot.appState.viewBackgroundColor).toBe(blue);
+      expect(h.history.undoStack).toHaveLength(undoDepth + 1);
+      Keyboard.undo();
+      expectScene(originalColor);
+      expect(h.history.undoStack).toHaveLength(undoDepth);
+      Keyboard.redo();
+      expectScene(red);
+    });
+
+    it("lets a same-batch NEVER supersede a pending canvas action", async () => {
+      const { container, editor, expectScene } = await openEmptyLabel();
+      const undoDepth = h.history.undoStack.length;
+      act(() => {
+        h.app.actionManager.executeAction(
+          actionChangeViewBackgroundColor,
+          "api",
+          {
+            viewBackgroundColor: red,
+          },
+        );
+        setBackground(blue, CaptureUpdateAction.NEVER);
+      });
+      Keyboard.exitTextEditor(editor);
+      expectScene(blue);
+      expect(h.history.undoStack).toHaveLength(undoDepth);
+      Keyboard.undo();
+      expect(h.state.viewBackgroundColor).toBe(blue);
+      expect(h.app.scene.getNonDeletedElement(container.id)).toBeNull();
+      Keyboard.redo();
+      expectScene(blue);
+    });
+
+    it("keeps draft geometry out of an explicit mixed scene capture", async () => {
+      const { container, editor, expectScene, originalColor } =
+        await openEmptyLabel(10);
+      const { width, height } = h.app.scene.getNonDeletedElement(container.id)!;
+      const undoDepth = h.history.undoStack.length;
+      act(() => {
+        h.app.updateScene({
+          elements: h.app.scene
+            .getElementsIncludingDeleted()
+            .map((el) =>
+              el.id === container.id ? newElementWith(el, { opacity: 50 }) : el,
+            ),
+          appState: { viewBackgroundColor: blue },
+          captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+        });
+      });
+      expect(h.store.snapshot.elements.get(container.id)).toMatchObject({
+        width: 10,
+        height: 10,
+        opacity: 50,
+      });
+      Keyboard.exitTextEditor(editor);
+      expectScene(blue, { width, height });
+      expect(h.history.undoStack).toHaveLength(undoDepth + 2);
+      Keyboard.undo();
+      expectScene(blue);
+      expect(h.app.scene.getNonDeletedElement(container.id)?.opacity).toBe(50);
+      Keyboard.undo();
+      expectScene(originalColor);
+      expect(h.app.scene.getNonDeletedElement(container.id)?.opacity).toBe(
+        container.opacity,
+      );
+      Keyboard.redo();
+      expectScene(blue);
+      expect(h.app.scene.getNonDeletedElement(container.id)?.opacity).toBe(50);
+      Keyboard.redo();
+      expectScene(blue, { width, height });
+    });
+  },
+);

@@ -2,26 +2,10 @@
 """Build in isolation and verify editor history in Chromium."""
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 import tempfile
-import time
-import urllib.request
-
-
-def wait_for_preview(server, url):
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if server.poll() is not None:
-            raise OSError('preview exited; inspect server.log')
-        try:
-            with urllib.request.urlopen(url, timeout=1) as response:
-                if response.status == 200:
-                    return
-        except OSError:
-            pass
-        time.sleep(0.2)
-    raise TimeoutError('preview did not become ready; inspect server.log')
 
 
 def stop_preview(server):
@@ -36,9 +20,11 @@ def stop_preview(server):
 def main():
     repo = Path(__file__).resolve().parents[2]
     app = repo / 'excalidraw-app'
-    artifacts = Path(os.environ.get(
-        'ARTIFACT_DIR', repo / 'test-results/empty-text-history',
-    )).resolve()
+    artifacts = Path(
+        os.environ.get('ARTIFACT_DIR')
+        or os.environ.get('WORKFLOW_ARTIFACT_DIR')
+        or repo / 'test-results/empty-text-history'
+    ).resolve()
     env = {
         **os.environ,
         'VITE_APP_ENABLE_ESLINT': 'false',
@@ -57,6 +43,9 @@ def main():
                 cwd=app, env=env, check=True, timeout=600,
             )
             stage = 'preview'
+            marker_name = f'preview-marker-{secrets.token_hex(16)}.txt'
+            marker_token = secrets.token_hex(32)
+            Path(build, marker_name).write_text(marker_token, encoding='ascii')
             with (artifacts / 'server.log').open('w') as log:
                 server = subprocess.Popen(
                     [vite, 'preview', '--outDir', build, '--host', '127.0.0.1',
@@ -64,11 +53,17 @@ def main():
                     cwd=app, env=env, stdout=log, stderr=log,
                 )
                 try:
-                    wait_for_preview(server, env['BASE_URL'])
+                    if server.poll() is not None:
+                        raise OSError('preview exited; inspect server.log')
                     stage = 'browser'
                     subprocess.run(
                         ['node', 'scripts/browser/empty-text-history.mjs'],
-                        cwd=repo, env=env, check=True, timeout=180,
+                        cwd=repo, env={
+                            **env,
+                            'PREVIEW_PID': str(server.pid),
+                            'PREVIEW_MARKER_NAME': marker_name,
+                            'PREVIEW_MARKER_TOKEN': marker_token,
+                        }, check=True, timeout=180,
                     )
                 finally:
                     check_failed = sys.exc_info()[0] is not None

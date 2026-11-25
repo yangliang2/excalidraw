@@ -239,6 +239,7 @@ import type {
   ExcalidrawIframeElement,
   ExcalidrawEmbeddableElement,
   Ordered,
+  OrderedExcalidrawElement,
   MagicGenerationData,
   ExcalidrawArrowElement,
   ExcalidrawElbowArrowElement,
@@ -482,10 +483,14 @@ type DraftSceneUpdate = {
   change: StoreChange;
   coalescible: boolean;
   previousAppState?: ObservedAppState;
+  elementPatches: Map<
+    string,
+    { fields: Partial<OrderedExcalidrawElement>; versionIncrement: number }
+  >;
 };
 
 type DraftSceneCapture = {
-  initialAppState: ObservedAppState;
+  labelId: string | undefined;
   updates: Partial<Pick<AppState, keyof ObservedAppState>>;
   queue: DraftSceneUpdate[];
   pendingFields: Map<keyof ObservedAppState, DraftSceneUpdate>;
@@ -3174,6 +3179,11 @@ class App extends React.Component<AppProps, AppState> {
       ? { ...this.state, ...this.draftSceneCapture.updates }
       : this.state;
 
+  private getNewShapeLabelId() {
+    const id = this.state.editingTextElement?.id;
+    return id && this.text.isEditingNewShapeLabel(id) ? id : undefined;
+  }
+
   private queueDraftSceneUpdate(
     source: "action" | "updateScene",
     appState: Partial<AppState>,
@@ -3191,7 +3201,7 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     const capture: DraftSceneCapture = (this.draftSceneCapture ??= {
-      initialAppState: getObservedAppState(this.state),
+      labelId: this.getNewShapeLabelId(),
       updates: {},
       queue: [],
       pendingFields: new Map(),
@@ -3205,19 +3215,44 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     let change: StoreChange = { elements: {}, appState: {} };
+    const elementPatches: DraftSceneUpdate["elementPatches"] = new Map();
     if (elements) {
       // Compute the element change against the live scene at the time of the
       // call. The scene can still contain the unsaved label and resize.
       const previous = StoreSnapshot.create(
         this.scene.getElementsMapIncludingDeleted(),
-        capture.initialAppState,
+        current,
       );
-      const next = previous.maybeClone(
-        action,
-        syncInvalidIndicesImmutable(elements),
-        undefined,
-      );
+      const normalized = syncInvalidIndicesImmutable(elements);
+      const next = previous.maybeClone(action, normalized, undefined);
       change = StoreChange.create(previous, next);
+
+      for (const [id, element] of Object.entries(change.elements)) {
+        const visible = previous.elements.get(id);
+        if (!visible) {
+          continue;
+        }
+        const fields: Partial<OrderedExcalidrawElement> = {};
+        const incoming = normalized?.get(id) ?? element;
+        for (const key of Delta.getDifferences(visible, incoming)) {
+          const prop = key as keyof OrderedExcalidrawElement;
+          const previousValue = visible[prop];
+          const nextValue = incoming[prop];
+          // A host may clone the scene, including unchanged nested values
+          // such as bindings that still belong to the draft.
+          if (
+            typeof previousValue !== "object" ||
+            typeof nextValue !== "object" ||
+            JSON.stringify(previousValue) !== JSON.stringify(nextValue)
+          ) {
+            Object.assign(fields, { [prop]: element[prop] });
+          }
+        }
+        elementPatches.set(id, {
+          fields,
+          versionIncrement: element.version - visible.version,
+        });
+      }
     }
 
     const last = capture.queue.at(-1);
@@ -3226,7 +3261,9 @@ class App extends React.Component<AppProps, AppState> {
     const coalescible =
       source === "action" && action === CaptureUpdateAction.IMMEDIATELY;
     const update: DraftSceneUpdate =
-      coalescible && last?.coalescible ? last : { action, change, coalescible };
+      coalescible && last?.coalescible
+        ? last
+        : { action, change, coalescible, elementPatches };
 
     if (action === CaptureUpdateAction.EVENTUALLY) {
       update.previousAppState = getObservedAppState(current);
@@ -3258,40 +3295,55 @@ class App extends React.Component<AppProps, AppState> {
   }
 
   private scheduleDraftSceneUpdates(capture: DraftSceneCapture) {
-    const emptyElements = StoreSnapshot.empty().elements;
-    let capturedElements = this.store.snapshot.elements;
-    let capturedAppState = capture.initialAppState;
+    let committed = this.store.snapshot;
     for (const [index, update] of capture.queue.entries()) {
-      const { action, change, previousAppState } = update;
-      if (action === CaptureUpdateAction.IMMEDIATELY) {
-        // A later NEVER write wins for the field, including when the earlier
-        // write was part of an element capture.
+      const { action, change, elementPatches, previousAppState } = update;
+      const appState = { ...change.appState };
+      if (update.coalescible) {
+        // A canvas action captures the final value of the batch. An explicit
+        // API capture keeps its own entry even if a later NEVER writes it.
         for (const [key, neverIndex] of capture.latestNever) {
           if (index < neverIndex) {
-            delete change.appState[key];
+            delete appState[key];
           }
         }
       }
 
-      const hasElements = !!Object.keys(change.elements).length;
-      const previous = StoreSnapshot.create(
-        hasElements ? capturedElements : emptyElements,
-        previousAppState ?? capturedAppState,
-      );
-      const next = hasElements
-        ? previous.applyChange(change)
-        : previous.maybeClone(action, undefined, {
-            ...previous.appState,
-            ...change.appState,
-          });
-      if (next === previous) {
-        continue;
+      const elements: StoreChange["elements"] = {};
+      for (const [id, element] of Object.entries(change.elements)) {
+        if (action === CaptureUpdateAction.EVENTUALLY) {
+          elements[id] = element;
+          continue;
+        }
+        const before = committed.elements.get(id);
+        if (!before && id === capture.labelId) {
+          continue;
+        }
+        const patch = elementPatches.get(id);
+        // Advance only by the versions introduced by this call. Any versions
+        // already added by the draft must still be visible to the next capture.
+        elements[id] =
+          before && patch
+            ? Object.assign({}, before, patch.fields, {
+                version: before.version + patch.versionIncrement,
+              })
+            : element;
       }
 
+      const previous = previousAppState
+        ? StoreSnapshot.create(committed.elements, previousAppState)
+        : committed;
+      const next = previous.applyChange({ elements, appState });
       const committedChange = {
-        elements: change.elements,
+        elements,
         appState: next.getChangedAppState(previous),
       };
+      if (
+        !Object.keys(elements).length &&
+        !Object.keys(committedChange.appState).length
+      ) {
+        continue;
+      }
       if (action === CaptureUpdateAction.IMMEDIATELY) {
         this.store.scheduleMicroAction({
           action,
@@ -3305,10 +3357,7 @@ class App extends React.Component<AppProps, AppState> {
         });
       }
       if (action !== CaptureUpdateAction.EVENTUALLY) {
-        capturedAppState = next.appState;
-        if (hasElements) {
-          capturedElements = next.elements;
-        }
+        committed = next;
       }
     }
   }
@@ -5298,10 +5347,7 @@ class App extends React.Component<AppProps, AppState> {
     }) => {
       const { elements, appState, collaborators, captureUpdate } = sceneData;
 
-      const editingText = this.state.editingTextElement;
-      const isEditingNewShapeLabel =
-        editingText && this.text.isEditingNewShapeLabel(editingText.id);
-      if (this.draftSceneCapture || isEditingNewShapeLabel) {
+      if (this.draftSceneCapture || this.getNewShapeLabelId()) {
         this.queueDraftSceneUpdate(
           "updateScene",
           appState ?? {},
@@ -11282,16 +11328,27 @@ class App extends React.Component<AppProps, AppState> {
           });
           return;
         }
-        // restore the fractional indices by mutating elements
-        syncInvalidIndices(elements.concat(ret.data.elements));
-
-        // don't capture and only update the store snapshot for old elements,
-        // otherwise we would end up with duplicated fractional indices on undo
-        this.store.scheduleMicroAction({
-          action: CaptureUpdateAction.NEVER,
-          elements,
-          appState: undefined,
-        });
+        // Keep the old and new fractional indices distinct on undo, without
+        // capturing the index repair as an edit.
+        if (this.draftSceneCapture || this.getNewShapeLabelId()) {
+          const previous = this.scene
+            .getElementsIncludingDeleted()
+            .map((element) => ({ ...element }));
+          syncInvalidIndices(previous.concat(ret.data.elements));
+          this.queueDraftSceneUpdate(
+            "updateScene",
+            {},
+            CaptureUpdateAction.NEVER,
+            previous,
+          );
+        } else {
+          syncInvalidIndices(elements.concat(ret.data.elements));
+          this.store.scheduleMicroAction({
+            action: CaptureUpdateAction.NEVER,
+            elements,
+            appState: undefined,
+          });
+        }
 
         this.setState({ isLoading: true });
         this.syncActionResult({

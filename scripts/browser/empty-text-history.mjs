@@ -1,14 +1,91 @@
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
+import { get } from "node:http";
+import { setTimeout as delay } from "node:timers/promises";
 
-const output = process.env.ARTIFACT_DIR || "test-results/empty-text-history";
+const output =
+  process.env.ARTIFACT_DIR ||
+  process.env.WORKFLOW_ARTIFACT_DIR ||
+  "test-results/empty-text-history";
+const baseURL = process.env.BASE_URL || "http://127.0.0.1:5176";
+
+const hasPreviewMarker = (url, token) =>
+  new Promise((resolve, reject) => {
+    // Connect directly to the loopback address and inspect this response only.
+    const request = get(
+      url,
+      { agent: false, signal: AbortSignal.timeout(1_000) },
+      async (response) => {
+        try {
+          if (response.statusCode !== 200) {
+            response.destroy();
+            resolve(false);
+            return;
+          }
+          let body = "";
+          response.setEncoding("utf8");
+          for await (const chunk of response) {
+            body += chunk;
+            if (body.length > token.length) {
+              resolve(false);
+              return;
+            }
+          }
+          resolve(body === token);
+        } catch (error) {
+          reject(error);
+        }
+      },
+    );
+    request.on("error", reject);
+  });
+
+const waitForOwnedPreview = async () => {
+  const pid = Number(process.env.PREVIEW_PID);
+  const name = process.env.PREVIEW_MARKER_NAME;
+  const token = process.env.PREVIEW_MARKER_TOKEN;
+  if (
+    !Number.isSafeInteger(pid) ||
+    pid <= 0 ||
+    !name ||
+    !/^[a-z0-9-]+\.txt$/.test(name) ||
+    !token ||
+    !/^http:\/\/127\.0\.0\.1:\d+$/.test(baseURL)
+  ) {
+    throw new Error("Missing preview ownership information");
+  }
+
+  const markerURL = new URL(name, baseURL);
+  const deadline = performance.now() + 30_000;
+  while (performance.now() < deadline) {
+    process.kill(pid, 0);
+    let matches;
+    try {
+      matches = await hasPreviewMarker(markerURL, token);
+    } catch (error) {
+      if (error.code !== "ECONNREFUSED") {
+        throw error;
+      }
+      await delay(200);
+      continue;
+    }
+    process.kill(pid, 0);
+    if (!matches) {
+      throw new Error("Preview did not return this build's readiness marker");
+    }
+    return;
+  }
+  throw new Error("Preview did not become ready; inspect server.log");
+};
+
 let browser;
 try {
+  await waitForOwnedPreview();
   await mkdir(output, { recursive: true });
   const { chromium } = await import("playwright");
   browser = await chromium.launch();
 } catch (error) {
-  console.error("Could not start the Chromium check", error);
+  console.error("Could not verify the preview or start Chromium", error);
   process.exit(2);
 }
 
@@ -43,7 +120,7 @@ try {
           JSON.parse(localStorage.getItem("excalidraw") || "[]"),
         );
       navigating = true;
-      await page.goto(process.env.BASE_URL || "http://127.0.0.1:5176", {
+      await page.goto(baseURL, {
         waitUntil: "domcontentloaded",
       });
       navigating = false;

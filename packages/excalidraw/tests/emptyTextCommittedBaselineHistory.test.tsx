@@ -22,6 +22,20 @@ const setBackground = (
   captureUpdate: CaptureUpdateActionType,
 ) => h.app.updateScene({ appState: { viewBackgroundColor }, captureUpdate });
 
+const reviseElement = (
+  id: string,
+  captureUpdate: CaptureUpdateActionType,
+  fields: { x?: number },
+) =>
+  act(() => {
+    h.app.updateScene({
+      elements: h.app.scene
+        .getElementsIncludingDeleted()
+        .map((el) => (el.id === id ? newElementWith(el, fields, true) : el)),
+      captureUpdate,
+    });
+  });
+
 const openEmptyLabel = async (size = 200) => {
   const originalColor = h.state.viewBackgroundColor;
   const container = UI.createElement("rectangle", {
@@ -75,6 +89,93 @@ describe.each([false, true])(
       expect(h.history.undoStack).toHaveLength(undoDepth);
       Keyboard.redo();
       expectScene(blue);
+    });
+
+    it("captures a canvas action that confirms a transient background color", async () => {
+      const { container, editor, expectScene, originalColor } =
+        await openEmptyLabel();
+      const undoDepth = h.history.undoStack.length;
+      act(() => setBackground(red, CaptureUpdateAction.EVENTUALLY));
+      expect(h.state.viewBackgroundColor).toBe(red);
+      expect(h.store.snapshot.appState.viewBackgroundColor).toBe(originalColor);
+
+      act(() =>
+        h.app.actionManager.executeAction(
+          actionChangeViewBackgroundColor,
+          "api",
+          { viewBackgroundColor: red },
+        ),
+      );
+      expect(h.store.snapshot.appState.viewBackgroundColor).toBe(red);
+      Keyboard.exitTextEditor(editor);
+      expectScene(red);
+      expect(h.history.undoStack).toHaveLength(undoDepth + 1);
+      Keyboard.undo();
+      expectScene(originalColor);
+      Keyboard.redo();
+      expect(h.state.viewBackgroundColor).toBe(red);
+      expect(h.app.scene.getNonDeletedElement(container.id)).toMatchObject({
+        width: 200,
+        height: 200,
+      });
+    });
+
+    it.each([CaptureUpdateAction.NEVER, CaptureUpdateAction.IMMEDIATELY])(
+      "captures a newer revision that confirms an independent transient move with %s",
+      async (captureUpdate) => {
+        const remote = UI.createElement("rectangle", {
+          x: 450,
+          y: 450,
+          width: 100,
+          height: 100,
+        });
+        const { editor } = await openEmptyLabel();
+        const undoDepth = h.history.undoStack.length;
+        const committed = () => h.store.snapshot.elements.get(remote.id);
+        const live = () => h.app.scene.getNonDeletedElement(remote.id)!;
+        reviseElement(remote.id, CaptureUpdateAction.EVENTUALLY, { x: 470 });
+        expect(live().x).toBe(470);
+        expect(committed()?.x).toBe(450);
+
+        reviseElement(remote.id, captureUpdate, {});
+        expect(committed()).toMatchObject({
+          x: 470,
+          version: live().version,
+          versionNonce: live().versionNonce,
+        });
+        const durable = captureUpdate === CaptureUpdateAction.IMMEDIATELY;
+        expect(h.history.undoStack).toHaveLength(undoDepth + Number(durable));
+        Keyboard.exitTextEditor(editor);
+        if (durable) {
+          Keyboard.undo();
+          expect(live().x).toBe(450);
+          Keyboard.redo();
+          expect(live().x).toBe(470);
+        }
+      },
+    );
+
+    it("keeps a confirmed remote move through label resize undo and redo", async () => {
+      const remote = UI.createElement("rectangle", {
+        x: 450,
+        y: 450,
+        width: 100,
+        height: 100,
+      });
+      const { container, editor } = await openEmptyLabel(10);
+      reviseElement(remote.id, CaptureUpdateAction.EVENTUALLY, { x: 470 });
+      reviseElement(remote.id, CaptureUpdateAction.NEVER, {});
+      Keyboard.exitTextEditor(editor);
+      const live = (id: string) => h.app.scene.getNonDeletedElement(id);
+      const { width, height } = live(container.id)!;
+      expect({ width, height }).not.toEqual({ width: 10, height: 10 });
+
+      Keyboard.undo();
+      expect(live(container.id)).toMatchObject({ width: 10, height: 10 });
+      expect(live(remote.id)?.x).toBe(470);
+      Keyboard.redo();
+      expect(live(container.id)).toMatchObject({ width, height });
+      expect(live(remote.id)?.x).toBe(470);
     });
 
     it("preserves an explicit capture before a same-batch NEVER and label exit", async () => {

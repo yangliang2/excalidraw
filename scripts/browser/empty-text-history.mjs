@@ -110,11 +110,16 @@ try {
     let context;
     let page;
     let navigating = false;
+    let pageCrashed = false;
     try {
       context = await browser.newContext({
         viewport: { width: 1200, height: 800 },
       });
       page = await context.newPage();
+      page.once("crash", () => {
+        pageCrashed = true;
+        recordEnvironmentError(new Error("Page crashed"));
+      });
       const read = () =>
         page.evaluate(() =>
           JSON.parse(localStorage.getItem("excalidraw") || "[]"),
@@ -176,6 +181,9 @@ try {
         JSON.stringify({ original, resized, afterUndo, afterRedo }, null, 2),
       ).catch(recordEnvironmentError);
     } catch (error) {
+      if (pageCrashed && !(error instanceof assert.AssertionError)) {
+        break;
+      }
       const previewUnavailable =
         navigating &&
         (error?.name === "TimeoutError" ||
@@ -196,6 +204,9 @@ try {
       }
     } finally {
       await context?.close().catch(recordEnvironmentError);
+    }
+    if (pageCrashed) {
+      break;
     }
   }
 } finally {

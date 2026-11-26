@@ -3238,9 +3238,33 @@ class App extends React.Component<AppProps, AppState> {
       const next = previous.maybeClone(action, normalized, undefined);
       change = StoreChange.create(previous, next);
 
+      const draftLabel = capture.labelId
+        ? previous.elements.get(capture.labelId)
+        : undefined;
+      const draftContainer =
+        draftLabel && isTextElement(draftLabel) && draftLabel.containerId
+          ? previous.elements.get(draftLabel.containerId)
+          : undefined;
+      const draftRelatedIds = new Set<string>();
+      if (draftContainer) {
+        draftRelatedIds.add(draftContainer.id);
+        for (const binding of draftContainer.boundElements ?? []) {
+          draftRelatedIds.add(binding.id);
+          if (binding.type === "arrow") {
+            const arrow = previous.elements.get(binding.id);
+            for (const arrowBinding of arrow?.boundElements ?? []) {
+              draftRelatedIds.add(arrowBinding.id);
+            }
+          }
+        }
+      }
+
       for (const [id, element] of Object.entries(change.elements)) {
         const visible = previous.elements.get(id);
-        if (!visible) {
+        // An independent revision can confirm content that is already
+        // visible after EVENTUALLY. Only project changes on draft-related
+        // elements, whose visible geometry or bindings may be speculative.
+        if (!visible || !draftRelatedIds.has(id)) {
           continue;
         }
         const fields: ElementUpdate<OrderedExcalidrawElement> = {};
@@ -3331,6 +3355,9 @@ class App extends React.Component<AppProps, AppState> {
         const before = committed.elements.get(id);
         const patch = elementPatches.get(id);
         if (!before || !patch) {
+          if (before && element.version <= before.version) {
+            continue;
+          }
           const bindings = element.boundElements;
           const filtered = bindings?.filter(({ id }) => id !== draftLabelId);
           elements[id] =
@@ -3483,7 +3510,13 @@ class App extends React.Component<AppProps, AppState> {
       const changedKeys = new Set(Delta.getRightDifferences(current, next));
       actionAppState = { ...actionAppState };
       for (const key of Object.keys(current) as (keyof ObservedAppState)[]) {
-        if (!changedKeys.has(key)) {
+        const confirmsBackground =
+          key === "viewBackgroundColor" &&
+          captureAppStateSeparately &&
+          actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY &&
+          current.viewBackgroundColor !==
+            this.store.snapshot.appState.viewBackgroundColor;
+        if (!changedKeys.has(key) && !confirmsBackground) {
           // Actions often return a copy of the state they were given. Keep
           // those fields out of both the React update and the history capture.
           delete actionAppState[key];

@@ -1,7 +1,8 @@
-"""Simulated preview services exercising the Node guard without Chromium."""
+"""Simulated preview and Playwright fixtures exercising the Node checker."""
 import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,12 +10,64 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 CHECKER = Path(__file__).with_name('empty-text-history.mjs')
 MARKER = 'preview-marker.txt'
 TOKEN = 'fixture-preview-token'
+
+PLAYWRIGHT_FIXTURE = """
+import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
+
+// Supply a matching readiness response in memory. The ownership tests
+// separately exercise the preview probe over a real HTTP connection.
+export function resolve(specifier, context, nextResolve) {
+  if (specifier === 'playwright' || specifier === 'node:http') {
+    return { url: import.meta.url, shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+
+export function get(_url, _options, callback) {
+  const response = Readable.from([process.env.PREVIEW_MARKER_TOKEN]);
+  response.statusCode = 200;
+  queueMicrotask(() => callback(response));
+  return new EventEmitter();
+}
+
+export const chromium = {
+  async launch() {
+    return {
+      isConnected: () => true,
+      close: async () => {},
+      async newContext() {
+        const page = new EventEmitter();
+        Object.assign(page, {
+          goto: async () => {},
+          locator: () => ({
+            first: () => ({
+              async waitFor() {
+                if (process.env.BROWSER_FAULT === 'crash') {
+                  page.emit('crash');
+                  throw new Error('locator.waitFor: Page crashed');
+                }
+              },
+            }),
+          }),
+          getByTestId: () => ({ click: async () => {} }),
+          mouse: { move: async () => {}, down: async () => {}, up: async () => {} },
+          waitForTimeout: async () => {},
+          evaluate: async () => [{ type: 'unexpected shape' }],
+          screenshot: async () => Buffer.alloc(0),
+        });
+        return { newPage: async () => page, close: async () => {} };
+      },
+    };
+  },
+};
+"""
 
 
 class ProtocolEnvironmentError(Exception):
@@ -79,7 +132,12 @@ export function resolve(specifier, context, nextResolve) {
 """)
             sentinel = Path(output, 'playwright-imported')
             thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            try:
+                environment_call('start preview fixture thread', thread.start)
+            except RuntimeError as error:
+                if str(error) != "can't start new thread":
+                    raise
+                raise ProtocolEnvironmentError(f'start preview fixture thread: {error}') from error
             try:
                 result = environment_call(
                     'run Node preview checker', subprocess.run,
@@ -157,6 +215,45 @@ export function resolve(specifier, context, nextResolve) {
         self.assertEqual(paths, ['/' + MARKER])
 
 
+class BrowserFailureTests(unittest.TestCase):
+    def run_browser_fault(self, fault):
+        with environment_call(
+            'create Playwright fixture directory', tempfile.TemporaryDirectory,
+        ) as output:
+            loader = Path(output, 'playwright-fixture.mjs')
+            environment_call('write Playwright fixture', loader.write_text, PLAYWRIGHT_FIXTURE)
+            return environment_call(
+                'run Node with simulated Playwright', subprocess.run,
+                ['node', '--experimental-loader', str(loader), str(CHECKER)],
+                env={
+                    **os.environ,
+                    'ARTIFACT_DIR': output,
+                    'BASE_URL': 'http://127.0.0.1:5176',
+                    'PREVIEW_PID': str(os.getpid()),
+                    'PREVIEW_MARKER_NAME': MARKER,
+                    'PREVIEW_MARKER_TOKEN': TOKEN,
+                    'BROWSER_FAULT': fault,
+                },
+                capture_output=True, text=True, timeout=10,
+            )
+
+    def test_page_crash_with_connected_browser_exits_two(self):
+        result = self.run_browser_fault('crash')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report['failures'], [])
+        self.assertIn('Page crashed', report['environmentError'])
+
+    def test_browser_behavior_assertion_exits_one(self):
+        result = self.run_browser_fault('assertion')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertNotIn('environmentError', report)
+        self.assertEqual(len(report['failures']), 3)
+        for failure in report['failures']:
+            self.assertIn('AssertionError', failure['error'])
+
+
 class ProtocolClassificationTests(unittest.TestCase):
     def test_fixture_resource_errors_in_tests_and_subtests_exit_two(self):
         for name, error, method in (
@@ -172,6 +269,17 @@ class ProtocolClassificationTests(unittest.TestCase):
                     stream=io.StringIO(), resultclass=ProtocolTestResult,
                 ).run(PreviewOwnershipTests(method))
                 self.assertEqual(result.exit_code(), 2)
+
+    def test_preview_thread_start_failure_exits_two_without_starting_node(self):
+        with patch(f'{__name__}.ThreadingHTTPServer', MagicMock()), patch.object(
+            threading.Thread, 'start', side_effect=RuntimeError("can't start new thread"),
+        ) as start, patch(f'{__name__}.subprocess.run') as run:
+            result = unittest.TextTestRunner(
+                stream=io.StringIO(), resultclass=ProtocolTestResult,
+            ).run(PreviewOwnershipTests('test_matching_body_allows_playwright_import_for_live_process'))
+            start.assert_called_once_with()
+            run.assert_not_called()
+            self.assertEqual(result.exit_code(), 2)
 
     def test_fixture_assertion_and_programming_errors_exit_one(self):
         for error in (AssertionError('simulated failed assertion'),

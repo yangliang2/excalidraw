@@ -481,13 +481,11 @@ import type { Action, ActionResult } from "../actions/types";
 type DraftSceneUpdate = {
   action: CaptureUpdateActionType;
   change: StoreChange;
-  coalescible: boolean;
   previousAppState?: ObservedAppState;
   elementPatches: Map<
     string,
     {
-      fields: ElementUpdate<OrderedExcalidrawElement>;
-      previousBindings: OrderedExcalidrawElement["boundElements"];
+      element: OrderedExcalidrawElement;
       versionIncrement: number;
     }
   >;
@@ -497,14 +495,41 @@ type DraftSceneCapture = {
   labelId: string | undefined;
   updates: Partial<Pick<AppState, keyof ObservedAppState>>;
   queue: DraftSceneUpdate[];
-  pendingCanvasFields: Map<keyof ObservedAppState, DraftSceneUpdate>;
+  pendingCanvasFields: Set<keyof ObservedAppState>;
 };
 
-const hasElementFieldChange = (previous: unknown, next: unknown) =>
-  previous !== next &&
-  (typeof previous !== "object" ||
-    typeof next !== "object" ||
-    JSON.stringify(previous) !== JSON.stringify(next));
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null &&
+  typeof value === "object" &&
+  (Object.getPrototypeOf(value) === Object.prototype ||
+    Object.getPrototypeOf(value) === null);
+
+// Match the Store's copy semantics for plain objects and arrays, and keep
+// identity comparison for other in-memory metadata values.
+const hasElementFieldChange = (previous: unknown, next: unknown): boolean => {
+  if (Object.is(previous, next)) {
+    return false;
+  }
+  if (Array.isArray(previous) && Array.isArray(next)) {
+    return (
+      previous.length !== next.length ||
+      Object.keys(previous).length !== Object.keys(next).length ||
+      previous.some((value, index) => hasElementFieldChange(value, next[index]))
+    );
+  }
+  if (isPlainRecord(previous) && isPlainRecord(next)) {
+    const keys = Object.keys(previous);
+    return (
+      keys.length !== Object.keys(next).length ||
+      keys.some(
+        (key) =>
+          !Object.prototype.hasOwnProperty.call(next, key) ||
+          hasElementFieldChange(previous[key], next[key]),
+      )
+    );
+  }
+  return true;
+};
 
 const isElementVersionField = (key: string) =>
   key === "version" || key === "versionNonce" || key === "updated";
@@ -3191,11 +3216,6 @@ class App extends React.Component<AppProps, AppState> {
       ? { ...this.state, ...this.draftSceneCapture.updates }
       : this.state;
 
-  private getNewShapeLabelId() {
-    const id = this.state.editingTextElement?.id;
-    return id && this.text.isEditingNewShapeLabel(id) ? id : undefined;
-  }
-
   private queueDraftSceneUpdate(
     source: "action" | "updateScene",
     appState: Partial<AppState>,
@@ -3208,26 +3228,30 @@ class App extends React.Component<AppProps, AppState> {
     const keys = (Object.keys(observed) as (keyof ObservedAppState)[]).filter(
       (key) => Object.prototype.hasOwnProperty.call(appState, key),
     );
-    if (!keys.length && !(action && elements)) {
+    const draft = this.text.newShapeLabelDraft;
+    if (!keys.length && !(elements && (action || draft))) {
       return;
     }
 
     const capture: DraftSceneCapture = (this.draftSceneCapture ??= {
-      labelId: this.getNewShapeLabelId(),
+      labelId: draft?.labelId,
       updates: {},
       queue: [],
-      pendingCanvasFields: new Map(),
+      pendingCanvasFields: new Set(),
     });
     for (const key of keys) {
       Object.assign(capture.updates, { [key]: state[key] });
     }
-    if (!action) {
+    if (source === "action" && action === CaptureUpdateAction.IMMEDIATELY) {
+      for (const key of keys) {
+        capture.pendingCanvasFields.add(key);
+      }
       return;
     }
 
     let change: StoreChange = { elements: {}, appState: {} };
     const elementPatches: DraftSceneUpdate["elementPatches"] = new Map();
-    if (elements) {
+    if (elements && (draft || action)) {
       // Compute the element change against the live scene at the time of the
       // call. The scene can still contain the unsaved label and resize.
       const previous = StoreSnapshot.create(
@@ -3235,113 +3259,114 @@ class App extends React.Component<AppProps, AppState> {
         current,
       );
       const normalized = syncInvalidIndicesImmutable(elements);
-      const next = previous.maybeClone(action, normalized, undefined);
+      const next = previous.maybeClone(
+        action ?? CaptureUpdateAction.EVENTUALLY,
+        normalized,
+        undefined,
+      );
       change = StoreChange.create(previous, next);
 
-      const draftLabel = capture.labelId
-        ? previous.elements.get(capture.labelId)
-        : undefined;
-      const draftContainer =
-        draftLabel && isTextElement(draftLabel) && draftLabel.containerId
-          ? previous.elements.get(draftLabel.containerId)
-          : undefined;
-      const draftRelatedIds = new Set<string>();
-      if (draftContainer) {
-        draftRelatedIds.add(draftContainer.id);
-        for (const binding of draftContainer.boundElements ?? []) {
-          draftRelatedIds.add(binding.id);
+      if (draft) {
+        const relatedIds = new Set<string>();
+        for (const binding of normalized?.get(draft.containerId)
+          ?.boundElements ?? []) {
+          if (binding.id === draft.labelId) {
+            continue;
+          }
+          relatedIds.add(binding.id);
           if (binding.type === "arrow") {
-            const arrow = previous.elements.get(binding.id);
+            const arrow = normalized?.get(binding.id);
             for (const arrowBinding of arrow?.boundElements ?? []) {
-              draftRelatedIds.add(arrowBinding.id);
+              relatedIds.add(arrowBinding.id);
             }
           }
         }
-      }
-
-      for (const [id, element] of Object.entries(change.elements)) {
-        const visible = previous.elements.get(id);
-        // An independent revision can confirm content that is already
-        // visible after EVENTUALLY. Only project changes on draft-related
-        // elements, whose visible geometry or bindings may be speculative.
-        if (!visible || !draftRelatedIds.has(id)) {
-          continue;
+        for (const id of relatedIds) {
+          const element = previous.elements.get(id) ?? change.elements[id];
+          if (element && !draft.elements.has(id)) {
+            draft.elements.set(id, deepCopyElement(element));
+          }
         }
-        const fields: ElementUpdate<OrderedExcalidrawElement> = {};
-        const incoming = normalized?.get(id) ?? element;
-        for (const key of Delta.getDifferences(visible, incoming)) {
-          if (isElementVersionField(key)) {
+
+        for (const [id, element] of Object.entries(change.elements)) {
+          const visible = previous.elements.get(id);
+          const hostElement = draft.elements.get(id);
+          if (!hostElement || !visible) {
             continue;
           }
-          const prop = key as keyof OrderedExcalidrawElement;
-          // A host may clone the scene, including unchanged nested values
-          // such as bindings that still belong to the draft.
-          if (hasElementFieldChange(visible[prop], incoming[prop])) {
-            Object.assign(fields, { [prop]: element[prop] });
+
+          // A complete host element may echo current layout from the editor.
+          // Keep the host's previous value for each echoed layout field.
+          const projected = { ...element };
+          const incoming = normalized?.get(id) ?? element;
+          for (const key of Delta.getDifferences<ExcalidrawElement>(
+            hostElement,
+            visible,
+            true,
+          )) {
+            if (isElementVersionField(key) || key === "boundElements") {
+              continue;
+            }
+            const prop = key as keyof OrderedExcalidrawElement;
+            if (
+              hasElementFieldChange(hostElement[prop], visible[prop]) &&
+              !hasElementFieldChange(visible[prop], incoming[prop])
+            ) {
+              Object.assign(projected, { [prop]: hostElement[prop] });
+            }
           }
+
+          const keepBinding = ({ id }: { id: string }) => id !== draft.labelId;
+          const removed = {
+            boundElements: visible.boundElements?.filter(keepBinding),
+          };
+          const added = {
+            boundElements: element.boundElements?.filter(keepBinding),
+          };
+          Delta.diffArrays(removed, added, "boundElements", ({ id }) => id);
+          const bindings = Delta.mergeArrays(
+            hostElement.boundElements,
+            added.boundElements,
+            removed.boundElements,
+            ({ id }) => id,
+          );
+          Object.assign(projected, {
+            boundElements: bindings.length
+              ? bindings
+              : hostElement.boundElements && [],
+          });
+          draft.elements.set(id, projected);
+          elementPatches.set(id, {
+            element: projected,
+            versionIncrement: element.version - visible.version,
+          });
         }
-        elementPatches.set(id, {
-          fields,
-          previousBindings:
-            fields.boundElements === undefined
-              ? null
-              : visible.boundElements?.map((binding) => ({ ...binding })) ??
-                null,
-          versionIncrement: element.version - visible.version,
-        });
       }
     }
 
-    const last = capture.queue.at(-1);
-    // Canvas actions share a history entry within a batch. Each explicit
-    // updateScene capture has its own history boundary.
-    const coalescible =
-      source === "action" && action === CaptureUpdateAction.IMMEDIATELY;
-    const update: DraftSceneUpdate =
-      coalescible && last?.coalescible
-        ? last
-        : { action, change, coalescible, elementPatches };
+    if (!action) {
+      return;
+    }
+    const update: DraftSceneUpdate = { action, change, elementPatches };
 
     if (action === CaptureUpdateAction.EVENTUALLY) {
       update.previousAppState = getObservedAppState(current);
     }
 
     for (const key of keys) {
-      if (coalescible) {
-        capture.pendingCanvasFields.set(key, update);
-        continue;
-      }
-      if (action !== CaptureUpdateAction.EVENTUALLY) {
-        capture.pendingCanvasFields.delete(key);
-      }
       Object.assign(update.change.appState, { [key]: observed[key] });
     }
 
-    if (update !== last) {
-      capture.queue.push(update);
-    }
+    capture.queue.push(update);
   }
 
   private scheduleDraftSceneUpdates(capture: DraftSceneCapture) {
     let committed = this.store.snapshot;
-    const finalAppState = getObservedAppState(this.state);
     const { labelId } = capture;
     const draftLabelId =
       labelId && !committed.elements.has(labelId) ? labelId : undefined;
     for (const update of capture.queue) {
-      const { action, change, coalescible, elementPatches, previousAppState } =
-        update;
-      let appState = change.appState;
-      if (coalescible) {
-        // Canvas actions capture the batch's final value, including transient
-        // API writes. Explicit captures and NEVER own the fields they write.
-        appState = {};
-        for (const [key, pending] of capture.pendingCanvasFields) {
-          if (pending === update) {
-            Object.assign(appState, { [key]: finalAppState[key] });
-          }
-        }
-      }
+      const { action, change, elementPatches, previousAppState } = update;
 
       const elements: StoreChange["elements"] = {};
       for (const [id, element] of Object.entries(change.elements)) {
@@ -3373,45 +3398,26 @@ class App extends React.Component<AppProps, AppState> {
           continue;
         }
 
-        const { boundElements, ...fields } = patch.fields;
-        const updates: ElementUpdate<OrderedExcalidrawElement> =
-          Object.fromEntries(
-            Object.entries(fields).filter(([key, value]) =>
-              hasElementFieldChange(before[key as keyof typeof before], value),
-            ),
-          );
-        if (boundElements !== undefined) {
-          const keepCommittedBinding = ({ id }: { id: string }) =>
-            id !== draftLabelId;
-          const removed = {
-            boundElements: patch.previousBindings?.filter(keepCommittedBinding),
-          };
-          const added = {
-            boundElements: boundElements?.filter(keepCommittedBinding),
-          };
-          Delta.diffArrays(removed, added, "boundElements", ({ id }) => id);
-          const bindings = Delta.mergeArrays(
-            before.boundElements,
-            added.boundElements,
-            removed.boundElements,
-            ({ id }) => id,
-          );
-          if (hasElementFieldChange(before.boundElements ?? [], bindings)) {
-            Object.assign(updates, { boundElements: bindings });
-          }
-        }
-        if (Object.keys(updates).length) {
+        const changed = Delta.getDifferences(before, patch.element, true).some(
+          (key) => {
+            const prop = key as keyof OrderedExcalidrawElement;
+            return (
+              !isElementVersionField(key) &&
+              hasElementFieldChange(before[prop], patch.element[prop])
+            );
+          },
+        );
+        if (changed) {
           // Advance only by this call's changes so the draft still has a
           // newer version when it is submitted.
           const version = before.version + patch.versionIncrement;
-          const projected = { ...before, ...updates };
           const matchesIncoming =
             version === element.version &&
-            !Delta.getDifferences(projected, element).some((key) => {
+            !Delta.getDifferences(patch.element, element, true).some((key) => {
               const prop = key as keyof OrderedExcalidrawElement;
               return (
                 !isElementVersionField(key) &&
-                hasElementFieldChange(projected[prop], element[prop])
+                hasElementFieldChange(patch.element[prop], element[prop])
               );
             });
 
@@ -3419,14 +3425,21 @@ class App extends React.Component<AppProps, AppState> {
           // ElementsDelta can miss the pending changes on label submission.
           elements[id] = matchesIncoming
             ? element
-            : newElementWith(before, { ...updates, version });
+            : newElementWith(before, {
+                ...patch.element,
+                version,
+                versionNonce: undefined,
+              });
         }
       }
 
       const previous = previousAppState
         ? StoreSnapshot.create(committed.elements, previousAppState)
         : committed;
-      const next = previous.applyChange({ elements, appState });
+      const next = previous.applyChange({
+        elements,
+        appState: change.appState,
+      });
       const committedChange = {
         elements,
         appState: next.getChangedAppState(previous),
@@ -3451,6 +3464,29 @@ class App extends React.Component<AppProps, AppState> {
       }
       if (action !== CaptureUpdateAction.EVENTUALLY) {
         committed = next;
+      }
+    }
+
+    // Store runs explicit scene captures before the batch-end capture. Keep
+    // that order for canvas state without including unsubmitted label elements.
+    if (capture.pendingCanvasFields.size) {
+      const finalAppState = getObservedAppState(this.state);
+      const next = committed.applyChange({
+        elements: {},
+        appState: Object.fromEntries(
+          [...capture.pendingCanvasFields].map((key) => [
+            key,
+            finalAppState[key],
+          ]),
+        ),
+      });
+      const appState = next.getChangedAppState(committed);
+      if (Object.keys(appState).length) {
+        this.store.scheduleMicroAction({
+          action: CaptureUpdateAction.IMMEDIATELY,
+          change: { elements: {}, appState },
+          delta: StoreDelta.calculate(committed, next),
+        });
       }
     }
   }
@@ -4698,7 +4734,7 @@ class App extends React.Component<AppProps, AppState> {
 
     const draftSceneCapture = this.draftSceneCapture;
     this.draftSceneCapture = null;
-    if (draftSceneCapture?.queue.length) {
+    if (draftSceneCapture) {
       this.scheduleDraftSceneUpdates(draftSceneCapture);
     }
 
@@ -5446,7 +5482,7 @@ class App extends React.Component<AppProps, AppState> {
     }) => {
       const { elements, appState, collaborators, captureUpdate } = sceneData;
 
-      if (this.draftSceneCapture || this.getNewShapeLabelId()) {
+      if (this.draftSceneCapture || this.text.newShapeLabelDraft) {
         this.queueDraftSceneUpdate(
           "updateScene",
           appState ?? {},
@@ -11429,7 +11465,7 @@ class App extends React.Component<AppProps, AppState> {
         }
         // Keep the old and new fractional indices distinct on undo, without
         // capturing the index repair as an edit.
-        if (this.draftSceneCapture || this.getNewShapeLabelId()) {
+        if (this.draftSceneCapture || this.text.newShapeLabelDraft) {
           const previous = this.scene
             .getElementsIncludingDeleted()
             .map((element) => ({ ...element }));

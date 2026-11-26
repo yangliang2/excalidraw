@@ -16,6 +16,7 @@ import { pointFrom, type Radians } from "@excalidraw/math";
 
 import {
   DEFAULT_BOUND_TEXT_LABEL_POSITION,
+  deepCopyElement,
   fixBindingsAfterDeletion,
   getActiveTextElement,
   getApproxMinLineHeight,
@@ -66,6 +67,13 @@ type AppTextDependencies = {
   getStylesPanelMode: () => StylesPanelMode;
 };
 
+type ShapeLabelDraft = {
+  labelId?: string;
+  containerId: string;
+  // Values before the editor's layout writes, updated only by host scene writes.
+  elements: Map<string, ExcalidrawElement>;
+};
+
 /**
  * Texts, but for the text tool's pointer interaction (`AppTextTool`):
  *
@@ -84,21 +92,25 @@ export class AppText {
   constructor(private app: App, private dependencies: AppTextDependencies) {}
 
   private textEditor: ReturnType<typeof textWysiwyg> | null = null;
-  private newShapeLabelId: string | null = null;
+  private shapeLabelDraft: ShapeLabelDraft | null = null;
+
+  public get newShapeLabelDraft() {
+    return this.shapeLabelDraft;
+  }
 
   public get textWysiwygSubmitHandler() {
     return this.textEditor?.submit ?? null;
   }
 
   public isEditingNewShapeLabel(elementId: string) {
-    return this.newShapeLabelId === elementId;
+    return this.shapeLabelDraft?.labelId === elementId;
   }
 
   public discardNewShapeLabel() {
-    if (this.newShapeLabelId) {
+    if (this.shapeLabelDraft) {
       this.textEditor?.discard();
       this.textEditor = null;
-      this.newShapeLabelId = null;
+      this.shapeLabelDraft = null;
     }
   }
 
@@ -296,18 +308,6 @@ export class AppText {
       }
     };
 
-    const container = getContainerElement(
-      element,
-      this.app.scene.getNonDeletedElementsMap(),
-    );
-    this.newShapeLabelId =
-      !isExistingElement &&
-      container &&
-      !isArrowElement(container) &&
-      !isStickyNoteElement(container)
-        ? element.id
-        : null;
-
     this.textEditor = textWysiwyg({
       canvas: this.app.canvas,
       getViewportCoords: (x, y) => {
@@ -333,7 +333,6 @@ export class AppText {
       }),
       onSubmit: withBatchedUpdates(({ viaKeyboard, nextOriginalText }) => {
         this.textEditor = null;
-        this.newShapeLabelId = null;
 
         const isDeleted = !nextOriginalText.trim();
         updateElement(nextOriginalText, isDeleted);
@@ -398,6 +397,7 @@ export class AppText {
           });
         }
 
+        this.shapeLabelDraft = null;
         if (!isDeleted || isExistingElement || didResizeContainer) {
           this.app.store.scheduleCapture();
         }
@@ -774,6 +774,25 @@ export class AppText {
       !isArrowElement(container) &&
       !isStickyNoteElement(container)
     ) {
+      const elements = new Map<string, ExcalidrawElement>([
+        [container.id, deepCopyElement(container)],
+      ]);
+      for (const binding of container.boundElements ?? []) {
+        const bound = this.app.scene.getNonDeletedElement(binding.id);
+        if (bound) {
+          elements.set(bound.id, deepCopyElement(bound));
+          if (isArrowElement(bound)) {
+            const label = getBoundTextElement(
+              bound,
+              this.app.scene.getNonDeletedElementsMap(),
+            );
+            if (label) {
+              elements.set(label.id, deepCopyElement(label));
+            }
+          }
+        }
+      }
+      this.shapeLabelDraft = { containerId: container.id, elements };
       const fontString = {
         fontSize,
         fontFamily,
@@ -890,6 +909,9 @@ export class AppText {
       });
 
     if (!existingTextElement && shouldBindToContainer && container) {
+      if (this.shapeLabelDraft?.containerId === container.id) {
+        this.shapeLabelDraft.labelId = element.id;
+      }
       this.app.scene.mutateElement(container, {
         boundElements: (container.boundElements || []).concat({
           type: "text",

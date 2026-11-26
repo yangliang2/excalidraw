@@ -1,6 +1,7 @@
 """Simulated preview and Playwright fixtures exercising the Node checker."""
 import errno
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import redirect_stderr
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import json
 import os
@@ -16,6 +17,7 @@ from unittest.mock import MagicMock, patch
 CHECKER = Path(__file__).with_name('empty-text-history.mjs')
 MARKER = 'preview-marker.txt'
 TOKEN = 'fixture-preview-token'
+RESOURCE_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.ENOBUFS, errno.EAGAIN}
 
 PLAYWRIGHT_FIXTURE = """
 import { EventEmitter } from 'node:events';
@@ -74,6 +76,34 @@ class ProtocolEnvironmentError(Exception):
     """The runner could not provide a resource needed by a protocol test."""
 
 
+class PreviewServer(HTTPServer):
+    # Only the preview's service thread handles requests. Report resource
+    # failures back to the test thread before it checks the Node result.
+    resource_error = None
+
+    def get_request(self):
+        try:
+            return super().get_request()
+        except OSError as error:
+            # socketserver suppresses accept errors before dispatching handlers.
+            if error.errno in RESOURCE_ERRNOS:
+                self.resource_error = error
+            raise
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, OSError) and error.errno in RESOURCE_ERRNOS:
+            self.resource_error = error
+        else:
+            super().handle_error(request, client_address)
+
+    def run(self):
+        try:
+            self.serve_forever()
+        except OSError as error:
+            self.resource_error = error
+
+
 def environment_call(operation, function, *args, **kwargs):
     try:
         return function(*args, **kwargs)
@@ -117,7 +147,7 @@ class PreviewOwnershipTests(unittest.TestCase):
         with environment_call(
             'create preview fixture directory', tempfile.TemporaryDirectory,
         ) as output, environment_call(
-            'listen for preview fixture', ThreadingHTTPServer, ('127.0.0.1', 0), Preview,
+            'listen for preview fixture', PreviewServer, ('127.0.0.1', 0), Preview,
         ) as server:
             loader = Path(output, 'loader.mjs')
             environment_call('write preview fixture loader', loader.write_text, """
@@ -131,7 +161,7 @@ export function resolve(specifier, context, nextResolve) {
 }
 """)
             sentinel = Path(output, 'playwright-imported')
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=server.run, daemon=True)
             try:
                 environment_call('start preview fixture thread', thread.start)
             except RuntimeError as error:
@@ -153,10 +183,14 @@ export function resolve(specifier, context, nextResolve) {
                     },
                     capture_output=True, text=True, timeout=10,
                 )
-                return result, sentinel.exists(), paths
             finally:
                 server.shutdown()
                 thread.join()
+            if server.resource_error is not None:
+                raise ProtocolEnvironmentError(
+                    f'serve preview fixture: {server.resource_error}',
+                ) from server.resource_error
+            return result, sentinel.exists(), paths
 
     @staticmethod
     def reply(body, *, status=200, location=None):
@@ -203,13 +237,11 @@ export function resolve(specifier, context, nextResolve) {
         self.assertEqual(paths, [])
 
     def test_unresponsive_http_service_does_not_import_playwright(self):
-        release = threading.Event()
-        try:
-            result, imported, paths = self.run_checker(
-                lambda request: release.wait(5),
-            )
-        finally:
-            release.set()
+        def wait_for_disconnect(request):
+            request.connection.settimeout(5)
+            request.rfile.read(1)
+
+        result, imported, paths = self.run_checker(wait_for_disconnect)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(imported)
         self.assertEqual(paths, ['/' + MARKER])
@@ -255,9 +287,70 @@ class BrowserFailureTests(unittest.TestCase):
 
 
 class ProtocolClassificationTests(unittest.TestCase):
+    def test_preview_request_needs_only_one_thread_and_classifies_resource_errors(self):
+        # Simulate a runner with one thread slot and drive socketserver's real
+        # request dispatch using an in-memory connection.
+        for failure, expected in (
+            (None, 0),
+            ('accept', 2),
+            ('handle', 2),
+        ):
+            with self.subTest(failure=failure):
+                error = OSError(errno.EMFILE, 'simulated request resource failure')
+                request = MagicMock()
+                if failure == 'handle':
+                    request.makefile.side_effect = error
+                request.makefile.return_value = io.BytesIO(
+                    f'GET /{MARKER} HTTP/1.0\r\n\r\n'.encode(),
+                )
+                stopped = threading.Event()
+                server = None
+                start_thread = threading.Thread.start
+                started = False
+
+                def start(thread):
+                    nonlocal started
+                    if started:
+                        raise RuntimeError("can't start new thread")
+                    started = True
+                    start_thread(thread)
+
+                def bind(instance):
+                    nonlocal server
+                    server = instance
+                    instance.server_port = 5176
+                    instance.server_name = 'localhost'
+
+                def run(command, *, env, **kwargs):
+                    server._handle_request_noblock()
+                    if any(call.args == (TOKEN.encode(),) for call in request.sendall.call_args_list):
+                        Path(env['IMPORT_SENTINEL']).touch()
+                    return subprocess.CompletedProcess(command, 2, stderr='')
+
+                def accept(_server):
+                    if failure == 'accept':
+                        raise error
+                    return request, ('127.0.0.1', 1)
+
+                with (
+                    patch.object(HTTPServer, 'server_bind', bind),
+                    patch.object(HTTPServer, 'server_activate'),
+                    patch.object(HTTPServer, 'serve_forever', stopped.wait),
+                    patch.object(HTTPServer, 'shutdown', stopped.set),
+                    patch.object(HTTPServer, 'get_request', accept),
+                    patch.object(threading.Thread, 'start', start),
+                    patch(f'{__name__}.subprocess.run', side_effect=run),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    stream = io.StringIO()
+                    result = unittest.TextTestRunner(
+                        stream=stream, resultclass=ProtocolTestResult,
+                    ).run(PreviewOwnershipTests('test_matching_body_allows_playwright_import_for_live_process'))
+                self.assertEqual(result.exit_code(), expected, stream.getvalue())
+
     def test_fixture_resource_errors_in_tests_and_subtests_exit_two(self):
         for name, error, method in (
-            ('ThreadingHTTPServer', OSError(errno.EMFILE, 'simulated socket failure'),
+            ('PreviewServer', OSError(errno.EMFILE, 'simulated socket failure'),
              'test_foreign_http_200_never_imports_playwright'),
             ('tempfile.TemporaryDirectory', PermissionError('simulated temp failure'),
              'test_redirect_to_matching_body_is_rejected'),
@@ -271,7 +364,7 @@ class ProtocolClassificationTests(unittest.TestCase):
                 self.assertEqual(result.exit_code(), 2)
 
     def test_preview_thread_start_failure_exits_two_without_starting_node(self):
-        with patch(f'{__name__}.ThreadingHTTPServer', MagicMock()), patch.object(
+        with patch(f'{__name__}.PreviewServer', MagicMock()), patch.object(
             threading.Thread, 'start', side_effect=RuntimeError("can't start new thread"),
         ) as start, patch(f'{__name__}.subprocess.run') as run:
             result = unittest.TextTestRunner(
@@ -285,7 +378,7 @@ class ProtocolClassificationTests(unittest.TestCase):
         for error in (AssertionError('simulated failed assertion'),
                       TypeError('simulated unary plus on fixture server')):
             with self.subTest(error=type(error)), patch(
-                f'{__name__}.ThreadingHTTPServer', side_effect=error,
+                f'{__name__}.PreviewServer', side_effect=error,
             ):
                 result = unittest.TextTestRunner(
                     stream=io.StringIO(), resultclass=ProtocolTestResult,

@@ -25,7 +25,11 @@ const setBackground = (
 const reviseElement = (
   id: string,
   captureUpdate: CaptureUpdateActionType,
-  fields: { x?: number },
+  fields: {
+    x?: number;
+    opacity?: number;
+    customData?: Record<string, unknown>;
+  },
 ) =>
   act(() => {
     h.app.updateScene({
@@ -287,6 +291,138 @@ describe.each([false, true])(
     });
   },
 );
+
+describe("explicit captures during a label draft", () => {
+  it.each([false, true])(
+    "undoes the batch-end canvas action before the explicit scene capture (mixed state: %s)",
+    async (mixedState) => {
+      const onIncrement = vi.fn<(increment: StoreIncrement) => void>();
+      await render(
+        <Excalidraw handleKeyboardGlobally onIncrement={onIncrement} />,
+      );
+      const remote = UI.createElement("rectangle", {
+        x: 450,
+        y: 450,
+        width: 100,
+        height: 100,
+      });
+      const { container, editor, originalColor } = await openEmptyLabel();
+      const originalName = h.state.name;
+      const nextName = mixedState ? "Updated scene" : originalName;
+      const undoDepth = h.history.undoStack.length;
+      onIncrement.mockClear();
+      act(() => {
+        h.app.actionManager.executeAction(
+          actionChangeViewBackgroundColor,
+          "api",
+          {
+            viewBackgroundColor: red,
+          },
+        );
+        h.app.updateScene({
+          elements: h.app.scene
+            .getElementsIncludingDeleted()
+            .map((element) =>
+              element.id === remote.id
+                ? newElementWith(element, { x: 470 })
+                : element,
+            ),
+          appState: mixedState ? { name: nextName } : undefined,
+          captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+        });
+      });
+      const expectFrame = (
+        x: number,
+        background: string,
+        name: typeof originalName,
+      ) => {
+        expect(h.app.scene.getNonDeletedElement(remote.id)?.x).toBe(x);
+        expect(h.app.scene.getNonDeletedElement(container.id)).toMatchObject({
+          width: 200,
+          height: 200,
+        });
+        expect(h.state.viewBackgroundColor).toBe(background);
+        expect(h.state.name).toBe(name);
+      };
+
+      expectFrame(470, red, nextName);
+      Keyboard.exitTextEditor(editor);
+      Keyboard.undo();
+      expectFrame(470, originalColor, nextName);
+      Keyboard.undo();
+      expectFrame(450, originalColor, originalName);
+      Keyboard.redo();
+      expectFrame(470, originalColor, nextName);
+      Keyboard.redo();
+      expectFrame(470, red, nextName);
+      expect(h.history.undoStack).toHaveLength(undoDepth + 2);
+      const durable = onIncrement.mock.calls
+        .map(([increment]) => increment)
+        .filter(StoreIncrement.isDurable);
+      expect(durable[0].change.elements[remote.id]?.x).toBe(470);
+      expect(durable[1].change.appState.viewBackgroundColor).toBe(red);
+    },
+  );
+
+  it.each([CaptureUpdateAction.NEVER, CaptureUpdateAction.IMMEDIATELY])(
+    "confirms already visible container opacity in a newer revision with %s",
+    async (captureUpdate) => {
+      await render(<Excalidraw handleKeyboardGlobally />);
+      const { container, editor } = await openEmptyLabel(10);
+      const live = () => h.app.scene.getNonDeletedElement(container.id)!;
+      const committed = () => h.store.snapshot.elements.get(container.id)!;
+      const undoDepth = h.history.undoStack.length;
+      reviseElement(container.id, CaptureUpdateAction.EVENTUALLY, {
+        opacity: 50,
+      });
+      expect(live().opacity).toBe(50);
+      expect(committed().opacity).toBe(100);
+
+      reviseElement(container.id, captureUpdate, {});
+      expect(committed().opacity).toBe(50);
+      expect(h.history.undoStack).toHaveLength(
+        undoDepth + Number(captureUpdate === CaptureUpdateAction.IMMEDIATELY),
+      );
+      Keyboard.exitTextEditor(editor);
+    },
+  );
+
+  it("keeps confirmed remote opacity through label resize undo and redo", async () => {
+    await render(<Excalidraw handleKeyboardGlobally />);
+    const { container, editor } = await openEmptyLabel(10);
+    const live = () => h.app.scene.getNonDeletedElement(container.id)!;
+    reviseElement(container.id, CaptureUpdateAction.EVENTUALLY, {
+      opacity: 50,
+    });
+    reviseElement(container.id, CaptureUpdateAction.NEVER, {});
+    Keyboard.exitTextEditor(editor);
+    const { width, height } = live();
+    expect({ width, height }).not.toEqual({ width: 10, height: 10 });
+    Keyboard.undo();
+    expect(live()).toMatchObject({ width: 10, height: 10, opacity: 50 });
+    Keyboard.redo();
+    expect(live()).toMatchObject({ width, height, opacity: 50 });
+  });
+
+  it("commits consecutive bigint metadata updates during a label draft", async () => {
+    await render(<Excalidraw handleKeyboardGlobally />);
+    const { container, editor } = await openEmptyLabel();
+    const undoDepth = h.history.undoStack.length;
+    for (const id of [9007199254740993n, 9007199254740994n]) {
+      reviseElement(container.id, CaptureUpdateAction.NEVER, {
+        customData: { id },
+      });
+      expect(
+        h.app.scene.getNonDeletedElement(container.id)?.customData?.id,
+      ).toBe(id);
+      expect(h.store.snapshot.elements.get(container.id)?.customData?.id).toBe(
+        id,
+      );
+    }
+    Keyboard.exitTextEditor(editor);
+    expect(h.history.undoStack).toHaveLength(undoDepth);
+  });
+});
 
 describe.each([CaptureUpdateAction.IMMEDIATELY, CaptureUpdateAction.NEVER])(
   "captures an arrow binding during a label draft with %s",

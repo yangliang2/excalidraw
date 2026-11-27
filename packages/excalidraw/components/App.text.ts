@@ -146,16 +146,17 @@ export class AppText {
     if (!label || label.isDeleted || !isTextElement(label)) {
       return null;
     }
-    const isEmpty = !label.originalText.trim();
-    if (label.containerId !== draft.containerId) {
-      return isEmpty ? "discard" : "preserve";
-    }
-    return isEmpty &&
-      !elements.some(
-        ({ id, isDeleted }) => id === draft.containerId && !isDeleted,
-      )
-      ? "discard"
+    const container = label.containerId
+      ? elements.find(({ id }) => id === label.containerId)
       : null;
+    const hasLiveContainer = container && !container.isDeleted;
+    if (label.containerId === draft.containerId && hasLiveContainer) {
+      return null;
+    }
+    if (!label.originalText.trim()) {
+      return "discard";
+    }
+    return label.containerId && !hasLiveContainer ? "detach" : "preserve";
   }
 
   private getTextCreationGridPoint = (x: number, y: number) => {
@@ -423,7 +424,12 @@ export class AppText {
             });
           }
           this.app.store.scheduleCapture((snapshot) => {
-            if (isDeleted && !didResize(snapshot)) {
+            const committedLabel = snapshot.elements.get(element.id);
+            if (
+              isDeleted &&
+              (!committedLabel || committedLabel.isDeleted) &&
+              !didResize(snapshot)
+            ) {
               return false;
             }
             this.app.prepareShapeLabelCapture(draft, snapshot);

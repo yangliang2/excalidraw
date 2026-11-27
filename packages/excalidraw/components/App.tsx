@@ -3239,6 +3239,7 @@ class App extends React.Component<AppProps, AppState> {
     const labelId = hostOwnsLabel ? undefined : draft?.labelId;
     const { current, updates } = this.trackDraftAppState(appState);
     let change: StoreChange = { elements: {}, appState: {} };
+    let capturesLabelRevision = false;
     const elementPatches = new Map<
       string,
       { element: OrderedExcalidrawElement; versionIncrement: number }
@@ -3259,6 +3260,28 @@ class App extends React.Component<AppProps, AppState> {
       change = StoreChange.create(previous, next);
 
       if (draft) {
+        const label = labelId ? change.elements[labelId] : undefined;
+        const visibleLabel = labelId
+          ? previous.elements.get(labelId)
+          : undefined;
+        // originalText is the authored body. Wrapped text can change as a
+        // side effect of layout while the host is echoing the draft.
+        if (
+          (action === CaptureUpdateAction.NEVER ||
+            action === CaptureUpdateAction.IMMEDIATELY) &&
+          label &&
+          isTextElement(label) &&
+          !label.isDeleted &&
+          label.originalText.trim() &&
+          visibleLabel &&
+          isTextElement(visibleLabel) &&
+          label.originalText !== visibleLabel.originalText
+        ) {
+          capturesLabelRevision = true;
+          if (!draft.elements.has(label.id)) {
+            draft.elements.set(label.id, label);
+          }
+        }
         const relatedIds = new Set<string>();
         for (const binding of normalized?.get(draft.containerId)
           ?.boundElements ?? []) {
@@ -3283,7 +3306,11 @@ class App extends React.Component<AppProps, AppState> {
         for (const [id, element] of Object.entries(change.elements)) {
           const visible = previous.elements.get(id);
           const hostElement = draft.elements.get(id);
-          if (!hostElement || !visible) {
+          if (
+            !hostElement ||
+            !visible ||
+            (hostOwnsLabel && id === draft.labelId)
+          ) {
             continue;
           }
 
@@ -3346,8 +3373,29 @@ class App extends React.Component<AppProps, AppState> {
     this.store.scheduleMicroAction({
       action,
       resolveChange: (committed) => {
+        const committedLabel = labelId
+          ? committed.elements.get(labelId)
+          : undefined;
+        const capturesHostLabel =
+          capturesLabelRevision ||
+          (committedLabel && !committedLabel.isDeleted);
         const draftLabelId =
-          labelId && !committed.elements.has(labelId) ? labelId : undefined;
+          capturesLabelRevision || committedLabel ? undefined : labelId;
+        const projectLabelBinding = (container: OrderedExcalidrawElement) => {
+          const bindings = container.boundElements;
+          if (!labelId || !capturesHostLabel) {
+            return bindings;
+          }
+          const keepsLabel = !change.elements[labelId]?.isDeleted;
+          const hasBinding =
+            bindings?.some(({ id }) => id === labelId) ?? false;
+          if (keepsLabel === hasBinding) {
+            return bindings;
+          }
+          return keepsLabel
+            ? [...(bindings ?? []), { type: "text", id: labelId } as const]
+            : bindings?.filter(({ id }) => id !== labelId) ?? null;
+        };
         const elements: StoreChange["elements"] = {};
         for (const [id, element] of Object.entries(change.elements)) {
           if (action === CaptureUpdateAction.EVENTUALLY) {
@@ -3378,23 +3426,48 @@ class App extends React.Component<AppProps, AppState> {
             continue;
           }
 
-          if (hasElementContentChange(before, patch.element)) {
+          const projected =
+            id === draft?.containerId
+              ? {
+                  ...patch.element,
+                  boundElements: projectLabelBinding(patch.element),
+                }
+              : patch.element;
+          if (hasElementContentChange(before, projected)) {
             // Advance only by this call's changes so the draft still has a
             // newer version when it is submitted.
             const version = before.version + patch.versionIncrement;
             const matchesIncoming =
               version === element.version &&
-              !hasElementContentChange(patch.element, element);
+              !hasElementContentChange(projected, element);
 
             // Different versions of the content must not share a nonce or
             // ElementsDelta can miss the pending changes on label submission.
             elements[id] = matchesIncoming
               ? element
               : newElementWith(before, {
-                  ...patch.element,
+                  ...projected,
                   version,
                   versionNonce: undefined,
                 });
+          }
+        }
+        // A host revision can change only the text element. Commit its
+        // reverse binding in the same increment even when the shape was echoed.
+        if (
+          action !== CaptureUpdateAction.EVENTUALLY &&
+          capturesHostLabel &&
+          draft &&
+          !elements[draft.containerId]
+        ) {
+          const container = committed.elements.get(draft.containerId);
+          if (container && !container.isDeleted) {
+            const boundElements = projectLabelBinding(container);
+            if (boundElements !== container.boundElements) {
+              elements[container.id] = newElementWith(container, {
+                boundElements,
+              });
+            }
           }
         }
 
@@ -3452,13 +3525,29 @@ class App extends React.Component<AppProps, AppState> {
   ) {
     const labelId = keepLabel ? undefined : draft.labelId;
     const projected = new Map(elements) as SceneElementsMap;
-    if (labelId) {
-      projected.delete(labelId);
+    const committedLabel = labelId
+      ? committed?.elements.get(labelId)
+      : undefined;
+    // While editing continues, retain the revision the host already captured.
+    if (labelId && projected.has(labelId)) {
+      if (committedLabel) {
+        projected.set(labelId, committedLabel);
+      } else {
+        projected.delete(labelId);
+      }
     }
     for (const [id, live] of projected) {
+      if (id === draft.labelId) {
+        continue;
+      }
       const host = draft.elements.get(id);
       const bindings = (host ?? live).boundElements;
       const filtered = bindings?.filter((binding) => binding.id !== labelId);
+      const previous = committed?.elements.get(id);
+      const committedBinding =
+        committedLabel && !committedLabel.isDeleted
+          ? previous?.boundElements?.find((binding) => binding.id === labelId)
+          : undefined;
       if (!host && filtered?.length === bindings?.length) {
         continue;
       }
@@ -3470,14 +3559,14 @@ class App extends React.Component<AppProps, AppState> {
         ...host,
         index: live.index,
         isDeleted: live.isDeleted,
-        boundElements:
-          filtered?.length === bindings?.length
-            ? bindings
-            : filtered?.length
-            ? filtered
-            : null,
+        boundElements: committedBinding
+          ? [...(filtered ?? []), committedBinding]
+          : filtered?.length === bindings?.length
+          ? bindings
+          : filtered?.length
+          ? filtered
+          : null,
       };
-      const previous = committed?.elements.get(id);
       if (previous && !hasElementContentChange(previous, element)) {
         projected.set(id, previous);
       } else if (hasElementContentChange(live, element)) {
@@ -5524,10 +5613,17 @@ class App extends React.Component<AppProps, AppState> {
         : null;
       const draftLabelId = this.text.newShapeLabelDraft?.labelId;
       const elements =
-        incoming && disposition === "discard" && draftLabelId
+        incoming &&
+        (disposition === "discard" || disposition === "detach") &&
+        draftLabelId
           ? incoming
-              .filter(({ id }) => id !== draftLabelId)
+              .filter(
+                ({ id }) => disposition !== "discard" || id !== draftLabelId,
+              )
               .map((element) => {
+                if (element.id === draftLabelId && isTextElement(element)) {
+                  return newElementWith(element, { containerId: null });
+                }
                 const bindings = element.boundElements?.filter(
                   ({ id }) => id !== draftLabelId,
                 );
@@ -5544,7 +5640,7 @@ class App extends React.Component<AppProps, AppState> {
           appState ?? {},
           captureUpdate,
           elements,
-          disposition === "preserve",
+          disposition === "preserve" || disposition === "detach",
         );
       } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;

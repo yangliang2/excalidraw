@@ -428,6 +428,170 @@ describe("label draft transaction boundaries", () => {
     },
   );
 
+  it.each(["remove", "soft-delete"])(
+    "keeps a nonempty label after host container %s and background undo",
+    async (operation) => {
+      await render(<Excalidraw handleKeyboardGlobally />);
+      const { container, editor, originalColor } = await openEmptyLabel(10);
+      const containerId = container.id;
+      const content = "Retained label";
+      updateTextEditor(editor, content);
+      const labelId = h.state.editingTextElement!.id;
+      const undoDepth = h.history.undoStack.length;
+
+      act(() =>
+        h.app.updateScene({
+          elements: h.app.scene.getElementsIncludingDeleted().flatMap((el) => {
+            if (el.id !== containerId) {
+              return [el];
+            }
+            return operation === "remove"
+              ? []
+              : [newElementWith(el, { isDeleted: true })];
+          }),
+          captureUpdate: CaptureUpdateAction.NEVER,
+        }),
+      );
+      if (editor.isConnected) {
+        Keyboard.exitTextEditor(editor);
+      }
+      expect(h.state.editingTextElement).toBeNull();
+      expect(h.history.undoStack).toHaveLength(undoDepth);
+
+      act(() =>
+        h.app.actionManager.executeAction(
+          actionChangeViewBackgroundColor,
+          "api",
+          {
+            viewBackgroundColor: red,
+          },
+        ),
+      );
+      for (const [move, color] of [
+        [Keyboard.undo, originalColor],
+        [Keyboard.redo, red],
+      ] as const) {
+        move();
+        expect(h.state.viewBackgroundColor).toBe(color);
+        expect(h.app.scene.getNonDeletedElement(containerId)).toBeNull();
+        expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject({
+          originalText: content,
+          containerId: null,
+        });
+        expect(h.store.snapshot.elements.get(labelId)).toMatchObject({
+          originalText: content,
+          containerId: null,
+        });
+      }
+    },
+  );
+
+  it.each([CaptureUpdateAction.NEVER, CaptureUpdateAction.IMMEDIATELY])(
+    "restores the host's revised draft text when undoing local input after %s",
+    async (captureUpdate) => {
+      await render(<Excalidraw handleKeyboardGlobally />);
+      const { container, editor } = await openEmptyLabel(10);
+      updateTextEditor(editor, "Before host revision");
+      const labelId = h.state.editingTextElement!.id;
+      const revision = "Host revision";
+      const localText = "Local edit after host revision";
+      const undoDepth = h.history.undoStack.length;
+
+      act(() =>
+        h.app.updateScene({
+          elements: h.app.scene
+            .getElementsIncludingDeleted()
+            .map((el) =>
+              el.id === labelId && el.type === "text"
+                ? newElementWith(el, { originalText: revision, text: revision })
+                : el,
+            ),
+          captureUpdate,
+        }),
+      );
+      expect(editor.isConnected).toBe(true);
+      updateTextEditor(editor, localText);
+      act(() =>
+        h.app.actionManager.executeAction(
+          actionChangeViewBackgroundColor,
+          "api",
+          {
+            viewBackgroundColor: red,
+          },
+        ),
+      );
+      expect(h.store.snapshot.elements.get(labelId)).toMatchObject({
+        originalText: revision,
+        containerId: container.id,
+      });
+      Keyboard.exitTextEditor(editor);
+
+      const expectBoundText = (originalText: string) => {
+        expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject({
+          originalText,
+          containerId: container.id,
+        });
+        expect(
+          h.app.scene.getNonDeletedElement(container.id)?.boundElements,
+        ).toContainEqual({
+          id: labelId,
+          type: "text",
+        });
+      };
+      expectBoundText(localText);
+      Keyboard.undo();
+      expectBoundText(revision);
+      expect(h.state.viewBackgroundColor).toBe(red);
+      expect(h.history.undoStack).toHaveLength(
+        undoDepth +
+          1 +
+          Number(captureUpdate === CaptureUpdateAction.IMMEDIATELY),
+      );
+      Keyboard.redo();
+      expectBoundText(localText);
+    },
+  );
+
+  it("clears the reverse binding when the host removes its published label", async () => {
+    await render(<Excalidraw handleKeyboardGlobally />);
+    const { container, editor } = await openEmptyLabel();
+    const id = container.id;
+    updateTextEditor(editor, "Draft text");
+    const labelId = h.state.editingTextElement!.id;
+    const hostText = "Host text";
+    act(() =>
+      h.app.updateScene({
+        elements: h.app.scene
+          .getElementsIncludingDeleted()
+          .map((el) =>
+            el.id === labelId && el.type === "text"
+              ? newElementWith(el, { originalText: hostText, text: hostText })
+              : el,
+          ),
+        captureUpdate: CaptureUpdateAction.NEVER,
+      }),
+    );
+    expect(h.store.snapshot.elements.get(labelId)?.isDeleted).toBe(false);
+
+    act(() =>
+      h.app.updateScene({
+        elements: h.app.scene
+          .getElementsIncludingDeleted()
+          .filter((el) => el.id !== labelId)
+          .map((el) =>
+            el.id === id ? newElementWith(el, { boundElements: null }) : el,
+          ),
+        captureUpdate: CaptureUpdateAction.NEVER,
+      }),
+    );
+    expect(editor.isConnected).toBe(false);
+    expect(h.store.snapshot.elements.get(labelId)?.isDeleted).toBe(true);
+    expect(h.app.scene.getNonDeletedElement(id)?.boundElements ?? []).toEqual(
+      [],
+    );
+    expect(h.store.snapshot.elements.get(id)?.boundElements ?? []).toEqual([]);
+  });
+
   it("keeps a host-detached nonempty label through background undo and redo", async () => {
     await render(<Excalidraw handleKeyboardGlobally />);
     const { container, editor, originalColor } = await openEmptyLabel(10);

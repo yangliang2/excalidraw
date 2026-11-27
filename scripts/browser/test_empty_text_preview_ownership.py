@@ -1,6 +1,6 @@
 """Simulated preview and Playwright fixtures exercising the Node checker."""
 import errno
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import json
@@ -120,6 +120,15 @@ def environment_call(operation, function, *args, **kwargs):
         raise ProtocolEnvironmentError(f'{operation}: {error}') from error
 
 
+@contextmanager
+def fixture_directory(name):
+    directory = environment_call(f'create {name} fixture directory', tempfile.TemporaryDirectory)
+    try:
+        yield directory.name
+    finally:
+        environment_call(f'clean up {name} fixture directory', directory.cleanup)
+
+
 def run_node(operation, command, *, expected_environment=None, **kwargs):
     result = environment_call(operation, subprocess.run, command, **kwargs)
     if result.returncode < 0:
@@ -172,9 +181,7 @@ class PreviewOwnershipTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        with environment_call(
-            'create preview fixture directory', tempfile.TemporaryDirectory,
-        ) as output, environment_call(
+        with fixture_directory('preview') as output, environment_call(
             'listen for preview fixture', PreviewServer, ('127.0.0.1', 0), Preview,
         ) as server:
             loader = Path(output, 'loader.mjs')
@@ -270,9 +277,7 @@ class PreviewOwnershipTests(unittest.TestCase):
 
 class BrowserFailureTests(unittest.TestCase):
     def run_browser_fault(self, fault, *, expected_environment=None):
-        with environment_call(
-            'create Playwright fixture directory', tempfile.TemporaryDirectory,
-        ) as output:
+        with fixture_directory('Playwright') as output:
             loader = Path(output, 'playwright-fixture.mjs')
             environment_call('write Playwright fixture', loader.write_text, PLAYWRIGHT_FIXTURE)
             return run_node(
@@ -448,6 +453,22 @@ class ProtocolClassificationTests(unittest.TestCase):
             start.assert_called_once_with()
             run.assert_not_called()
             self.assertEqual(result.exit_code(), 2)
+
+    def test_fixture_directory_cleanup_io_error_exits_two(self):
+        cleanup = tempfile.TemporaryDirectory.cleanup
+
+        def fail_cleanup(directory):
+            cleanup(directory)
+            raise OSError(errno.EIO, 'simulated fixture cleanup I/O failure')
+
+        with patch.object(
+            tempfile.TemporaryDirectory, 'cleanup', autospec=True, side_effect=fail_cleanup,
+        ):
+            stream = io.StringIO()
+            result = unittest.TextTestRunner(
+                stream=stream, resultclass=ProtocolTestResult,
+            ).run(BrowserFailureTests('test_browser_behavior_assertion_exits_one'))
+        self.assertEqual(result.exit_code(), 2, stream.getvalue())
 
     def test_fixture_assertion_and_programming_errors_exit_one(self):
         for error in (AssertionError('simulated failed assertion'),

@@ -6,7 +6,6 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile
@@ -19,19 +18,19 @@ CHECKER = Path(__file__).with_name('empty-text-history.mjs')
 MARKER = 'preview-marker.txt'
 TOKEN = 'fixture-preview-token'
 RESOURCE_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.ENOBUFS, errno.EAGAIN}
-NODE_RESOURCE_CODES = {
-    errno.errorcode[number]
-    for number in RESOURCE_ERRNOS | {errno.EACCES, errno.EPERM, errno.ENOSPC, errno.EROFS}
-}
-
 PLAYWRIGHT_FIXTURE = """
 import { EventEmitter } from 'node:events';
+import { writeSync } from 'node:fs';
 import { Readable } from 'node:stream';
 
 // Supply a matching readiness response in memory. The ownership tests
 // separately exercise the preview probe over a real HTTP connection.
 export function resolve(specifier, context, nextResolve) {
-  if (specifier === 'playwright' || specifier === 'node:http') {
+  if (specifier === 'playwright') {
+    writeSync(1, JSON.stringify({ fixture: 'playwright-import' }) + '\\n');
+    return { url: import.meta.url, shortCircuit: true };
+  }
+  if (specifier === 'node:http' && process.env.FIXTURE_PREVIEW === 'memory') {
     return { url: import.meta.url, shortCircuit: true };
   }
   return nextResolve(specifier, context);
@@ -46,6 +45,11 @@ export function get(_url, _options, callback) {
 
 export const chromium = {
   async launch() {
+    if (process.env.BROWSER_FAULT === 'EDQUOT' || process.env.BROWSER_FAULT === 'ENOSPC') {
+      throw Object.assign(new Error('simulated browser startup resource failure'), {
+        code: process.env.BROWSER_FAULT,
+      });
+    }
     return {
       isConnected: () => true,
       close: async () => {},
@@ -116,19 +120,23 @@ def environment_call(operation, function, *args, **kwargs):
         raise ProtocolEnvironmentError(f'{operation}: {error}') from error
 
 
-def run_node(operation, command, **kwargs):
+def run_node(operation, command, *, expected_environment=None, **kwargs):
     result = environment_call(operation, subprocess.run, command, **kwargs)
     if result.returncode < 0:
         raise ProtocolEnvironmentError(
             f'{operation}: terminated by signal {-result.returncode}',
         )
+    try:
+        *events, report = (json.loads(line) for line in (result.stdout or '').splitlines())
+    except ValueError:
+        events, report = [], {}
+    if not isinstance(report, dict):
+        report = {}
     if result.returncode == 2:
-        # Exit 2 is also expected when the checker rejects an unowned preview.
-        # A Node system error identifies a resource failure inside the child.
-        resource_error = re.search(r"^ *code: '([A-Z]+)',?$", result.stderr, re.MULTILINE)
-        if resource_error and resource_error[1] in NODE_RESOURCE_CODES:
+        outcome = (report.get('phase'), report.get('outcome'))
+        if outcome != expected_environment:
             raise ProtocolEnvironmentError(f'{operation}: {result.stderr.strip()}')
-    return result
+    return result, report, events
 
 
 class ProtocolTestResult(unittest.TextTestResult):
@@ -170,17 +178,7 @@ class PreviewOwnershipTests(unittest.TestCase):
             'listen for preview fixture', PreviewServer, ('127.0.0.1', 0), Preview,
         ) as server:
             loader = Path(output, 'loader.mjs')
-            environment_call('write preview fixture loader', loader.write_text, """
-import { writeFileSync } from 'node:fs';
-export function resolve(specifier, context, nextResolve) {
-  if (specifier === 'playwright') {
-    writeFileSync(process.env.IMPORT_SENTINEL, '');
-    throw new Error('fixture stopped before Chromium startup');
-  }
-  return nextResolve(specifier, context);
-}
-""")
-            sentinel = Path(output, 'playwright-imported')
+            environment_call('write preview fixture loader', loader.write_text, PLAYWRIGHT_FIXTURE)
             thread = threading.Thread(target=server.run, daemon=True)
             try:
                 environment_call('start preview fixture thread', thread.start)
@@ -189,9 +187,10 @@ export function resolve(specifier, context, nextResolve) {
                     raise
                 raise ProtocolEnvironmentError(f'start preview fixture thread: {error}') from error
             try:
-                result = run_node(
+                result, _, events = run_node(
                     'run Node preview checker',
                     ['node', '--experimental-loader', str(loader), str(CHECKER)],
+                    expected_environment=('preview', 'rejected'),
                     env={
                         **os.environ,
                         'ARTIFACT_DIR': output,
@@ -199,7 +198,8 @@ export function resolve(specifier, context, nextResolve) {
                         'PREVIEW_PID': str(os.getpid() if pid is None else pid),
                         'PREVIEW_MARKER_NAME': MARKER,
                         'PREVIEW_MARKER_TOKEN': TOKEN,
-                        'IMPORT_SENTINEL': str(sentinel),
+                        'FIXTURE_PREVIEW': 'http',
+                        'BROWSER_FAULT': 'assertion',
                     },
                     capture_output=True, text=True, timeout=10,
                 )
@@ -210,7 +210,7 @@ export function resolve(specifier, context, nextResolve) {
                 raise ProtocolEnvironmentError(
                     f'serve preview fixture: {server.resource_error}',
                 ) from server.resource_error
-            return result, sentinel.exists(), paths
+            return result, {'fixture': 'playwright-import'} in events, paths
 
     @staticmethod
     def reply(body, *, status=200, location=None):
@@ -240,7 +240,8 @@ export function resolve(specifier, context, nextResolve) {
 
     def test_matching_body_allows_playwright_import_for_live_process(self):
         result, imported, paths = self.run_checker(self.reply(TOKEN))
-        self.assertEqual(result.returncode, 2, result.stderr)
+        # The fixture reaches the actual history check and fails its assertion.
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertTrue(imported)
         self.assertEqual(paths, ['/' + MARKER])
 
@@ -268,7 +269,7 @@ export function resolve(specifier, context, nextResolve) {
 
 
 class BrowserFailureTests(unittest.TestCase):
-    def run_browser_fault(self, fault):
+    def run_browser_fault(self, fault, *, expected_environment=None):
         with environment_call(
             'create Playwright fixture directory', tempfile.TemporaryDirectory,
         ) as output:
@@ -277,6 +278,7 @@ class BrowserFailureTests(unittest.TestCase):
             return run_node(
                 'run Node with simulated Playwright',
                 ['node', '--experimental-loader', str(loader), str(CHECKER)],
+                expected_environment=expected_environment,
                 env={
                     **os.environ,
                     'ARTIFACT_DIR': output,
@@ -284,26 +286,38 @@ class BrowserFailureTests(unittest.TestCase):
                     'PREVIEW_PID': str(os.getpid()),
                     'PREVIEW_MARKER_NAME': MARKER,
                     'PREVIEW_MARKER_TOKEN': TOKEN,
+                    'FIXTURE_PREVIEW': 'memory',
                     'BROWSER_FAULT': fault,
                 },
                 capture_output=True, text=True, timeout=10,
             )
 
     def test_page_crash_with_connected_browser_exits_two(self):
-        result = self.run_browser_fault('crash')
+        result, report, _ = self.run_browser_fault(
+            'crash', expected_environment=('browser-check', None),
+        )
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        report = json.loads(result.stdout)
         self.assertEqual(report['failures'], [])
         self.assertIn('Page crashed', report['environmentError'])
 
     def test_browser_behavior_assertion_exits_one(self):
-        result = self.run_browser_fault('assertion')
+        result, report, _ = self.run_browser_fault('assertion')
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        report = json.loads(result.stdout)
         self.assertNotIn('environmentError', report)
         self.assertEqual(len(report['failures']), 3)
         for failure in report['failures']:
             self.assertIn('AssertionError', failure['error'])
+
+    def test_browser_startup_resource_errors_exit_two(self):
+        for fault in ('EDQUOT', 'ENOSPC'):
+            with self.subTest(fault=fault):
+                with self.assertRaises(ProtocolEnvironmentError):
+                    self.run_browser_fault(fault)
+                result, report, _ = self.run_browser_fault(
+                    fault, expected_environment=('browser-initialization', 'environment'),
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('simulated browser startup resource failure', report['environmentError'])
 
 
 class ProtocolClassificationTests(unittest.TestCase):
@@ -327,7 +341,8 @@ class ProtocolClassificationTests(unittest.TestCase):
             (None, 0),
             ('accept', 2),
             ('handle', 2),
-            ('import-marker-write', 2),
+            ('ENOSPC', 2),
+            ('EDQUOT', 2),
             ('unexpected-rejection', 1),
         ):
             with self.subTest(failure=failure):
@@ -358,19 +373,34 @@ class ProtocolClassificationTests(unittest.TestCase):
 
                 def run(command, *, env, **kwargs):
                     server._handle_request_noblock()
-                    if failure == 'import-marker-write':
+                    if failure in ('ENOSPC', 'EDQUOT'):
                         return subprocess.CompletedProcess(
-                            command, 2, stdout='',
-                            stderr="Error: simulated ENOSPC writing import marker\n  code: 'ENOSPC',\n",
+                            command, 2,
+                            stdout=json.dumps({
+                                'phase': 'browser-initialization',
+                                'outcome': 'environment',
+                                'environmentError': f'simulated {failure}',
+                            }),
+                            stderr='',
                         )
                     if failure == 'unexpected-rejection':
                         return subprocess.CompletedProcess(
-                            command, 2, stdout='',
-                            stderr="Error: Preview did not return this build's readiness marker\n",
+                            command, 2, stdout=json.dumps({'phase': 'preview', 'outcome': 'rejected'}),
+                            stderr='',
                         )
                     if any(call.args == (TOKEN.encode(),) for call in request.sendall.call_args_list):
-                        Path(env['IMPORT_SENTINEL']).touch()
-                    return subprocess.CompletedProcess(command, 2, stderr='')
+                        return subprocess.CompletedProcess(
+                            command, 1,
+                            stdout='\n'.join((
+                                json.dumps({'fixture': 'playwright-import'}),
+                                json.dumps({'phase': 'browser-check'}),
+                            )),
+                            stderr='',
+                        )
+                    return subprocess.CompletedProcess(
+                        command, 2, stdout=json.dumps({'phase': 'preview', 'outcome': 'rejected'}),
+                        stderr='',
+                    )
 
                 def accept(_server):
                     if failure == 'accept':

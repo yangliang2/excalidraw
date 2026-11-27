@@ -9,6 +9,19 @@ const output =
   "test-results/empty-text-history";
 const baseURL = process.env.BASE_URL || "http://127.0.0.1:5176";
 
+class PreviewRejected extends Error {}
+
+const assertPreviewAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error.code === "ESRCH") {
+      throw new PreviewRejected("Preview process is no longer running");
+    }
+    throw error;
+  }
+};
+
 const hasPreviewMarker = (url, token) =>
   new Promise((resolve, reject) => {
     // Connect directly to the loopback address and inspect this response only.
@@ -58,34 +71,51 @@ const waitForOwnedPreview = async () => {
   const markerURL = new URL(name, baseURL);
   const deadline = performance.now() + 30_000;
   while (performance.now() < deadline) {
-    process.kill(pid, 0);
+    assertPreviewAlive(pid);
     let matches;
     try {
       matches = await hasPreviewMarker(markerURL, token);
     } catch (error) {
+      if (error.code === "ABORT_ERR") {
+        throw new PreviewRejected(
+          "Preview did not respond to the ownership probe",
+        );
+      }
       if (error.code !== "ECONNREFUSED") {
         throw error;
       }
       await delay(200);
       continue;
     }
-    process.kill(pid, 0);
+    assertPreviewAlive(pid);
     if (!matches) {
-      throw new Error("Preview did not return this build's readiness marker");
+      throw new PreviewRejected(
+        "Preview did not return this build's readiness marker",
+      );
     }
     return;
   }
-  throw new Error("Preview did not become ready; inspect server.log");
+  throw new PreviewRejected("Preview did not become ready; inspect server.log");
 };
 
 let browser;
+let phase = "preview";
 try {
   await waitForOwnedPreview();
+  phase = "browser-initialization";
   await mkdir(output, { recursive: true });
   const { chromium } = await import("playwright");
   browser = await chromium.launch();
 } catch (error) {
   console.error("Could not verify the preview or start Chromium", error);
+  const result = {
+    phase,
+    outcome: error instanceof PreviewRejected ? "rejected" : "environment",
+    environmentError: String(error),
+  };
+  await new Promise((resolve) => {
+    process.stdout.write(`${JSON.stringify(result)}\n`, resolve);
+  });
   process.exit(2);
 }
 
@@ -217,5 +247,7 @@ const result = { checks, failures, environmentError };
 await writeFile(`${output}/result.json`, JSON.stringify(result, null, 2)).catch(
   recordEnvironmentError,
 );
-console.log(JSON.stringify({ ...result, environmentError }));
+console.log(
+  JSON.stringify({ phase: "browser-check", ...result, environmentError }),
+);
 process.exitCode = failures.length ? 1 : environmentError ? 2 : 0;

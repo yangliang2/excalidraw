@@ -3233,9 +3233,10 @@ class App extends React.Component<AppProps, AppState> {
     appState: Partial<AppState>,
     action?: CaptureUpdateActionType,
     elements?: SceneData["elements"],
+    hostOwnsLabel = false,
   ) {
     const draft = this.text.newShapeLabelDraft;
-    const labelId = draft?.labelId;
+    const labelId = hostOwnsLabel ? undefined : draft?.labelId;
     const { current, updates } = this.trackDraftAppState(appState);
     let change: StoreChange = { elements: {}, appState: {} };
     const elementPatches = new Map<
@@ -3307,7 +3308,7 @@ class App extends React.Component<AppProps, AppState> {
             }
           }
 
-          const keepBinding = ({ id }: { id: string }) => id !== draft.labelId;
+          const keepBinding = ({ id }: { id: string }) => id !== labelId;
           const removed = {
             boundElements: visible.boundElements?.filter(keepBinding),
           };
@@ -3353,13 +3354,7 @@ class App extends React.Component<AppProps, AppState> {
             elements[id] = element;
             continue;
           }
-          // An explicit host detach makes this text independent of the draft.
-          if (
-            id === draftLabelId &&
-            (element.isDeleted ||
-              !isTextElement(element) ||
-              element.containerId !== null)
-          ) {
+          if (id === draftLabelId) {
             continue;
           }
           const before = committed.elements.get(id);
@@ -3418,12 +3413,44 @@ class App extends React.Component<AppProps, AppState> {
     });
   }
 
+  public prepareShapeLabelCapture(
+    draft: NonNullable<AppText["newShapeLabelDraft"]>,
+    snapshot: StoreSnapshot,
+  ) {
+    const ids = [...draft.elements.keys()];
+    if (draft.labelId) {
+      ids.push(draft.labelId);
+    }
+    for (const id of ids) {
+      const live = this.scene.getElement(id);
+      const committed = snapshot.elements.get(id);
+      if (
+        live &&
+        committed &&
+        (live.version <= committed.version ||
+          live.versionNonce === committed.versionNonce) &&
+        hasElementContentChange(committed, live)
+      ) {
+        // A projected revision can catch up with the canvas revision. Bump
+        // the actual scene element before the Store captures the final layout.
+        this.scene.mutateElement(
+          live,
+          { version: Math.max(live.version, committed.version) + 1 },
+          { informMutation: false, isDragging: false },
+        );
+      }
+    }
+  }
+
   private projectDraftElements(
     elements: SceneElementsMap,
     draft: NonNullable<AppText["newShapeLabelDraft"]>,
-    committed?: StoreSnapshot,
+    {
+      committed,
+      keepLabel = false,
+    }: { committed?: StoreSnapshot; keepLabel?: boolean } = {},
   ) {
-    const { labelId } = draft;
+    const labelId = keepLabel ? undefined : draft.labelId;
     const projected = new Map(elements) as SceneElementsMap;
     if (labelId) {
       projected.delete(labelId);
@@ -3482,19 +3509,18 @@ class App extends React.Component<AppProps, AppState> {
     const label = draft.labelId
       ? this.scene.getNonDeletedElement(draft.labelId)
       : null;
-    if (
-      label &&
-      (!isTextElement(label) ||
-        label.containerId !== draft.containerId ||
-        label.originalText.trim())
-    ) {
+    if (label && !isTextElement(label)) {
+      return;
+    }
+    const keepLabel = !!label?.originalText.trim();
+    if (keepLabel && label?.containerId === draft.containerId) {
       return;
     }
 
-    // Remove the empty orphan if the host removed its container. When the host
-    // removed the label instead, also undo the layout it may have echoed.
+    // Drop the previous container's draft layout. An explicit nonempty
+    // rebind or detach keeps the host's label and its new bindings.
     const live = this.scene.getElementsMapIncludingDeleted();
-    const projected = this.projectDraftElements(live, draft);
+    const projected = this.projectDraftElements(live, draft, { keepLabel });
     const restored = [...projected.values()]
       .filter((element) => live.get(element.id) !== element)
       .map((element) => deepCopyElement(element));
@@ -4940,7 +4966,7 @@ class App extends React.Component<AppProps, AppState> {
       this.state,
       draft
         ? (committed) =>
-            this.projectDraftElements(elementsMap, draft, committed)
+            this.projectDraftElements(elementsMap, draft, { committed })
         : undefined,
     );
 
@@ -5491,10 +5517,35 @@ class App extends React.Component<AppProps, AppState> {
        */
       captureUpdate?: SceneData["captureUpdate"];
     }) => {
-      const { elements, appState, collaborators, captureUpdate } = sceneData;
+      const { appState, collaborators, captureUpdate } = sceneData;
+      const incoming = sceneData.elements;
+      const disposition = incoming
+        ? this.text.getIncomingShapeLabelDisposition(incoming)
+        : null;
+      const draftLabelId = this.text.newShapeLabelDraft?.labelId;
+      const elements =
+        incoming && disposition === "discard" && draftLabelId
+          ? incoming
+              .filter(({ id }) => id !== draftLabelId)
+              .map((element) => {
+                const bindings = element.boundElements?.filter(
+                  ({ id }) => id !== draftLabelId,
+                );
+                return bindings?.length !== element.boundElements?.length
+                  ? newElementWith(element, {
+                      boundElements: bindings?.length ? bindings : null,
+                    })
+                  : element;
+              })
+          : incoming;
 
       if (this.pendingDraftAppState || this.text.newShapeLabelDraft) {
-        this.scheduleDraftSceneUpdate(appState ?? {}, captureUpdate, elements);
+        this.scheduleDraftSceneUpdate(
+          appState ?? {},
+          captureUpdate,
+          elements,
+          disposition === "preserve",
+        );
       } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;
         const observedAppState = appState

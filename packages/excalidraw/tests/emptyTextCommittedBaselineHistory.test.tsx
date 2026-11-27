@@ -241,6 +241,162 @@ describe("label draft transaction boundaries", () => {
     });
   });
 
+  it("captures the label geometry after a background action commits transient opacity", async () => {
+    await render(<Excalidraw handleKeyboardGlobally />);
+    const { container, editor } = await openEmptyLabel(10);
+    const { id } = container;
+    const originalGeometry = { x: 200, y: 200, width: 10, height: 10 };
+    updateTextEditor(editor, "Order approved");
+    const labelId = h.state.editingTextElement!.id;
+    const labelBinding = { id: labelId, type: "text" };
+    const live = () => h.app.scene.getNonDeletedElement(id);
+    reviseElement(id, CaptureUpdateAction.EVENTUALLY, { opacity: 50 });
+    act(() =>
+      h.app.actionManager.executeAction(
+        actionChangeViewBackgroundColor,
+        "api",
+        { viewBackgroundColor: red },
+      ),
+    );
+    expect(h.store.snapshot.elements.get(id)).toMatchObject({
+      ...originalGeometry,
+      opacity: 50,
+    });
+    expect(h.store.snapshot.elements.has(labelId)).toBe(false);
+    Keyboard.exitTextEditor(editor);
+
+    const submitted = live()!;
+    expect(submitted.height).toBeGreaterThan(originalGeometry.height);
+    expect(submitted.boundElements).toContainEqual(labelBinding);
+    Keyboard.undo();
+    expect(live()).toMatchObject({ ...originalGeometry, opacity: 50 });
+    expect(live()?.boundElements ?? []).toEqual([]);
+    expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
+    expect(h.state.viewBackgroundColor).toBe(red);
+
+    Keyboard.redo();
+    expect(live()).toMatchObject({
+      x: submitted.x,
+      y: submitted.y,
+      width: submitted.width,
+      height: submitted.height,
+      opacity: 50,
+    });
+    expect(live()?.boundElements).toContainEqual(labelBinding);
+    expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject({
+      originalText: "Order approved",
+      containerId: id,
+    });
+    expect(h.state.viewBackgroundColor).toBe(red);
+  });
+
+  describe.each([CaptureUpdateAction.NEVER, CaptureUpdateAction.IMMEDIATELY])(
+    "host label changes captured with %s",
+    (captureUpdate) => {
+      it.each([
+        { operation: "detach", content: "", size: 200 },
+        { operation: "rebind", content: "", size: 200 },
+        { operation: "detach", content: "Host label", size: 200 },
+        { operation: "rebind", content: "Host label", size: 200 },
+        { operation: "rebind", content: "Host label", size: 10 },
+      ])(
+        "handles $operation of a label with content $content on a $size px shape",
+        async ({ operation, content, size }) => {
+          await render(<Excalidraw handleKeyboardGlobally />);
+          const target = UI.createElement("rectangle", {
+            x: 450,
+            y: 200,
+            width: 200,
+            height: 200,
+          });
+          const { container, editor, originalColor } = await openEmptyLabel(
+            size,
+          );
+          if (content) {
+            updateTextEditor(editor, content);
+          }
+          const labelId = h.state.editingTextElement!.id;
+          const targetId = operation === "rebind" ? target.id : null;
+          const reference = { id: labelId, type: "text" } as const;
+          const undoDepth = h.history.undoStack.length;
+
+          act(() =>
+            h.app.updateScene({
+              elements: h.app.scene.getElementsIncludingDeleted().map((el) => {
+                if (el.id === labelId && el.type === "text") {
+                  return newElementWith(el, { containerId: targetId });
+                }
+                if (el.id === container.id) {
+                  return newElementWith(el, { boundElements: null });
+                }
+                if (el.id === targetId) {
+                  return newElementWith(el, { boundElements: [reference] });
+                }
+                return el;
+              }),
+              captureUpdate,
+            }),
+          );
+          if (editor.isConnected) {
+            Keyboard.exitTextEditor(editor);
+          }
+          expect(h.state.editingTextElement).toBeNull();
+
+          const expectHostScene = () => {
+            for (const get of [
+              (id: string) => h.app.scene.getNonDeletedElement(id),
+              (id: string) => h.store.snapshot.elements.get(id),
+            ]) {
+              if (content) {
+                expect(get(labelId)).toMatchObject({
+                  originalText: content,
+                  containerId: targetId,
+                  isDeleted: false,
+                });
+              } else {
+                expect(get(labelId)?.isDeleted).not.toBe(false);
+              }
+              expect(get(container.id)).toMatchObject({
+                width: size,
+                height: size,
+              });
+              expect(get(container.id)?.boundElements ?? []).toEqual([]);
+              expect(get(target.id)?.boundElements ?? []).toEqual(
+                content && targetId ? [reference] : [],
+              );
+            }
+          };
+          expectHostScene();
+          act(() =>
+            h.app.actionManager.executeAction(
+              actionChangeViewBackgroundColor,
+              "api",
+              { viewBackgroundColor: red },
+            ),
+          );
+          Keyboard.undo();
+          expect(h.state.viewBackgroundColor).toBe(originalColor);
+          expectHostScene();
+
+          if (content && captureUpdate === CaptureUpdateAction.IMMEDIATELY) {
+            expect(h.history.undoStack).toHaveLength(undoDepth + 1);
+            Keyboard.undo();
+            expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
+            expect(
+              h.app.scene.getNonDeletedElement(target.id)?.boundElements ?? [],
+            ).toEqual([]);
+            expect(h.state.viewBackgroundColor).toBe(originalColor);
+            Keyboard.redo();
+            expectHostScene();
+          }
+          Keyboard.redo();
+          expect(h.state.viewBackgroundColor).toBe(red);
+          expectHostScene();
+        },
+      );
+    },
+  );
+
   it.each(["remove", "soft-delete"])(
     "cleans up the empty label when the host invalidates its container: %s",
     async (operation) => {

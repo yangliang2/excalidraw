@@ -135,6 +135,29 @@ export class AppText {
     return true;
   }
 
+  public getIncomingShapeLabelDisposition(
+    elements: readonly ExcalidrawElement[],
+  ) {
+    const draft = this.shapeLabelDraft;
+    if (!draft?.labelId) {
+      return null;
+    }
+    const label = elements.find(({ id }) => id === draft.labelId);
+    if (!label || label.isDeleted || !isTextElement(label)) {
+      return null;
+    }
+    const isEmpty = !label.originalText.trim();
+    if (label.containerId !== draft.containerId) {
+      return isEmpty ? "discard" : "preserve";
+    }
+    return isEmpty &&
+      !elements.some(
+        ({ id, isDeleted }) => id === draft.containerId && !isDeleted,
+      )
+      ? "discard"
+      : null;
+  }
+
   private getTextCreationGridPoint = (x: number, y: number) => {
     const effectiveGridSize = this.app.getEffectiveGridSize();
 
@@ -377,30 +400,37 @@ export class AppText {
         // change only if the size differs from the store's snapshot.
         const draft = this.shapeLabelDraft;
         this.shapeLabelDraft = null;
-        if (!isDeleted || isExistingElement) {
-          this.app.store.scheduleCapture();
-        } else if (draft) {
+        if (draft) {
           const container = this.app.scene.getNonDeletedElement(
             draft.containerId,
           );
-          if (container) {
-            const { id, width, height } = container;
-            const resizedFrom = (previous: ExcalidrawElement | undefined) =>
-              !!previous &&
-              !previous.isDeleted &&
-              (width !== previous.width || height !== previous.height);
-            const didResize = (snapshot: StoreSnapshot) =>
-              resizedFrom(snapshot.elements.get(id));
-            if (
-              didResize(this.app.store.snapshot) ||
-              resizedFrom(draft.elements.get(id))
-            ) {
-              updateBoundElements(container, this.app.scene, {
-                renderEnvironment: this.app.renderEnvironment,
-              });
-            }
-            this.app.store.scheduleCapture(didResize);
+          const resizedFrom = (previous: ExcalidrawElement | undefined) =>
+            container &&
+            previous &&
+            !previous.isDeleted &&
+            (container.width !== previous.width ||
+              container.height !== previous.height);
+          const didResize = (snapshot: StoreSnapshot) =>
+            resizedFrom(snapshot.elements.get(draft.containerId));
+          if (
+            isDeleted &&
+            container &&
+            (didResize(this.app.store.snapshot) ||
+              resizedFrom(draft.elements.get(draft.containerId)))
+          ) {
+            updateBoundElements(container, this.app.scene, {
+              renderEnvironment: this.app.renderEnvironment,
+            });
           }
+          this.app.store.scheduleCapture((snapshot) => {
+            if (isDeleted && !didResize(snapshot)) {
+              return false;
+            }
+            this.app.prepareShapeLabelCapture(draft, snapshot);
+            return true;
+          });
+        } else if (!isDeleted || isExistingElement) {
+          this.app.store.scheduleCapture();
         }
 
         // Apply keyboard selection before the finalize action, as part of

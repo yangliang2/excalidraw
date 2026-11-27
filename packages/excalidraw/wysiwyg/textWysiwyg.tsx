@@ -1046,10 +1046,8 @@ export const textWysiwyg = ({
     // it'd get stuck in an infinite loop of blur→onSubmit after we re-focus the
     // wysiwyg on update
     discard();
-    const updateElement = app.scene.getElement(
-      element.id,
-    ) as ExcalidrawTextElement;
-    if (!updateElement) {
+    const updateElement = app.scene.getNonDeletedElement(element.id);
+    if (!updateElement || !isTextElement(updateElement)) {
       return;
     }
     const container = getContainerElement(

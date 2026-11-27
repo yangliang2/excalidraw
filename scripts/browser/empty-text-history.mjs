@@ -176,6 +176,7 @@ try {
       );
       assert.deepEqual(redone.boundElements || [], []);
       checks++;
+      await saveScreenshot(page, `${type}-redo.png`);
       await writeFile(
         `${output}/${type}.json`,
         JSON.stringify({ original, resized, afterUndo, afterRedo }, null, 2),

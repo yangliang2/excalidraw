@@ -111,6 +111,15 @@ def environment_call(operation, function, *args, **kwargs):
         raise ProtocolEnvironmentError(f'{operation}: {error}') from error
 
 
+def run_node(operation, command, **kwargs):
+    result = environment_call(operation, subprocess.run, command, **kwargs)
+    if result.returncode < 0:
+        raise ProtocolEnvironmentError(
+            f'{operation}: terminated by signal {-result.returncode}',
+        )
+    return result
+
+
 class ProtocolTestResult(unittest.TextTestResult):
     environment_failed = False
 
@@ -169,8 +178,8 @@ export function resolve(specifier, context, nextResolve) {
                     raise
                 raise ProtocolEnvironmentError(f'start preview fixture thread: {error}') from error
             try:
-                result = environment_call(
-                    'run Node preview checker', subprocess.run,
+                result = run_node(
+                    'run Node preview checker',
                     ['node', '--experimental-loader', str(loader), str(CHECKER)],
                     env={
                         **os.environ,
@@ -254,8 +263,8 @@ class BrowserFailureTests(unittest.TestCase):
         ) as output:
             loader = Path(output, 'playwright-fixture.mjs')
             environment_call('write Playwright fixture', loader.write_text, PLAYWRIGHT_FIXTURE)
-            return environment_call(
-                'run Node with simulated Playwright', subprocess.run,
+            return run_node(
+                'run Node with simulated Playwright',
                 ['node', '--experimental-loader', str(loader), str(CHECKER)],
                 env={
                     **os.environ,
@@ -287,6 +296,19 @@ class BrowserFailureTests(unittest.TestCase):
 
 
 class ProtocolClassificationTests(unittest.TestCase):
+    def test_node_signals_exit_two(self):
+        for returncode in (-9, -15):
+            with self.subTest(returncode=returncode), patch(
+                f'{__name__}.subprocess.run',
+                return_value=subprocess.CompletedProcess(
+                    ['node'], returncode, stdout='', stderr='',
+                ),
+            ):
+                result = unittest.TextTestRunner(
+                    stream=io.StringIO(), resultclass=ProtocolTestResult,
+                ).run(BrowserFailureTests('test_browser_behavior_assertion_exits_one'))
+                self.assertEqual(result.exit_code(), 2)
+
     def test_preview_request_needs_only_one_thread_and_classifies_resource_errors(self):
         # Simulate a runner with one thread slot and drive socketserver's real
         # request dispatch using an in-memory connection.

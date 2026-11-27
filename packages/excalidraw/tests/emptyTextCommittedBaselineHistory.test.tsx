@@ -65,6 +65,183 @@ const openEmptyLabel = async (size = 200) => {
   return { container, editor, expectScene, originalColor };
 };
 
+describe("label draft transaction boundaries", () => {
+  const drawLargeRectangle = () =>
+    UI.createElement("rectangle", {
+      x: 200,
+      y: 200,
+      width: 200,
+      height: 200,
+    });
+
+  const startLabel = () => new Pointer("mouse").doubleClickAt(300, 300);
+
+  it("captures each explicit update across the start of a draft in one batch", async () => {
+    const onIncrement = vi.fn<(increment: StoreIncrement) => void>();
+    await render(
+      <Excalidraw handleKeyboardGlobally onIncrement={onIncrement} />,
+    );
+    const container = drawLargeRectangle();
+    const originalColor = h.state.viewBackgroundColor;
+    const undoDepth = h.history.undoStack.length;
+    onIncrement.mockClear();
+
+    act(() => {
+      setBackground(red, CaptureUpdateAction.IMMEDIATELY);
+      startLabel();
+      setBackground(blue, CaptureUpdateAction.IMMEDIATELY);
+    });
+    const colors = onIncrement.mock.calls
+      .map(([increment]) => increment)
+      .filter(StoreIncrement.isDurable)
+      .map(({ change }) => change.appState.viewBackgroundColor);
+    expect(colors).toEqual([red, blue]);
+    expect(h.store.snapshot.appState.viewBackgroundColor).toBe(blue);
+    Keyboard.exitTextEditor(await getTextEditor());
+    expect(h.history.undoStack).toHaveLength(undoDepth + 2);
+
+    const expectColor = (color: string) => {
+      expect(h.state.viewBackgroundColor).toBe(color);
+      expect(h.app.scene.getNonDeletedElement(container.id)).toMatchObject({
+        width: 200,
+        height: 200,
+      });
+    };
+    Keyboard.undo();
+    expectColor(red);
+    Keyboard.undo();
+    expectColor(originalColor);
+    Keyboard.redo();
+    expectColor(red);
+    Keyboard.redo();
+    expectColor(blue);
+  });
+
+  it("captures the final scene name with the batch-end canvas action", async () => {
+    await render(<Excalidraw handleKeyboardGlobally />);
+    const { editor, expectScene, originalColor } = await openEmptyLabel();
+    const originalName = h.state.name;
+    const undoDepth = h.history.undoStack.length;
+    act(() => {
+      h.app.actionManager.executeAction(
+        actionChangeViewBackgroundColor,
+        "api",
+        {
+          viewBackgroundColor: red,
+        },
+      );
+      h.app.updateScene({
+        appState: { name: "Renamed in the same batch" },
+        captureUpdate: CaptureUpdateAction.EVENTUALLY,
+      });
+    });
+    expect(h.store.snapshot.appState).toMatchObject({
+      viewBackgroundColor: red,
+      name: "Renamed in the same batch",
+    });
+    Keyboard.exitTextEditor(editor);
+    expect(h.history.undoStack).toHaveLength(undoDepth + 1);
+
+    Keyboard.undo();
+    expectScene(originalColor);
+    expect(h.state.name).toBe(originalName);
+    Keyboard.redo();
+    expectScene(red);
+    expect(h.state.name).toBe("Renamed in the same batch");
+  });
+
+  it.each(["remove", "soft-delete", "reset"] as const)(
+    "restores ordinary scene capture after the host invalidates a draft: %s",
+    async (operation) => {
+      await render(<Excalidraw handleKeyboardGlobally />);
+      drawLargeRectangle();
+      startLabel();
+      const editor = await getTextEditor();
+      const labelId = h.state.editingTextElement!.id;
+
+      act(() => {
+        if (operation === "reset") {
+          h.app.api.resetScene();
+        } else {
+          const elements = h.app.scene.getElementsIncludingDeleted();
+          h.app.updateScene({
+            elements:
+              operation === "remove"
+                ? elements.filter(({ id }) => id !== labelId)
+                : elements.map((element) =>
+                    element.id === labelId
+                      ? newElementWith(element, { isDeleted: true })
+                      : element,
+                  ),
+            captureUpdate: CaptureUpdateAction.NEVER,
+          });
+        }
+      });
+      if (editor.isConnected) {
+        Keyboard.exitTextEditor(editor);
+      }
+      expect(h.state.editingTextElement).toBeNull();
+      expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
+
+      const committedColor = h.store.snapshot.appState.viewBackgroundColor;
+      const undoDepth = h.history.undoStack.length;
+      act(() => setBackground(red, CaptureUpdateAction.EVENTUALLY));
+      expect(h.state.viewBackgroundColor).toBe(red);
+      act(() => setBackground(red, CaptureUpdateAction.IMMEDIATELY));
+      expect(h.store.snapshot.appState.viewBackgroundColor).toBe(
+        committedColor,
+      );
+      expect(h.history.undoStack).toHaveLength(undoDepth);
+    },
+  );
+
+  it("keeps an invalidated draft out of a pending canvas capture", async () => {
+    const onIncrement = vi.fn<(increment: StoreIncrement) => void>();
+    await render(
+      <Excalidraw handleKeyboardGlobally onIncrement={onIncrement} />,
+    );
+    const { container, originalColor } = await openEmptyLabel(10);
+    const labelId = h.state.editingTextElement!.id;
+    onIncrement.mockClear();
+
+    act(() => {
+      h.app.actionManager.executeAction(
+        actionChangeViewBackgroundColor,
+        "api",
+        {
+          viewBackgroundColor: red,
+        },
+      );
+      h.app.updateScene({
+        elements: h.app.scene
+          .getElementsIncludingDeleted()
+          .filter(({ id }) => id !== labelId),
+        captureUpdate: CaptureUpdateAction.NEVER,
+      });
+    });
+
+    const durable = onIncrement.mock.calls
+      .map(([increment]) => increment)
+      .filter(StoreIncrement.isDurable);
+    expect(durable).toHaveLength(1);
+    expect(durable[0].change.elements).toEqual({});
+    expect(durable[0].change.appState.viewBackgroundColor).toBe(red);
+    expect(h.store.snapshot.elements.get(container.id)).toMatchObject({
+      width: 10,
+      height: 10,
+    });
+    expect(
+      h.app.scene.getNonDeletedElement(container.id)?.boundElements ?? [],
+    ).toEqual([]);
+    Keyboard.undo();
+    expect(h.state.viewBackgroundColor).toBe(originalColor);
+    expect(h.app.scene.getNonDeletedElement(container.id)).toMatchObject({
+      width: 10,
+      height: 10,
+    });
+  });
+});
+
 describe.each([false, true])(
   "with an increment subscriber: %s",
   (subscribe) => {

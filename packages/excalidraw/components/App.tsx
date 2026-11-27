@@ -478,26 +478,6 @@ import type {
 import type { RoughCanvas } from "roughjs/bin/canvas";
 import type { Action, ActionResult } from "../actions/types";
 
-type DraftSceneUpdate = {
-  action: CaptureUpdateActionType;
-  change: StoreChange;
-  previousAppState?: ObservedAppState;
-  elementPatches: Map<
-    string,
-    {
-      element: OrderedExcalidrawElement;
-      versionIncrement: number;
-    }
-  >;
-};
-
-type DraftSceneCapture = {
-  labelId: string | undefined;
-  updates: Partial<Pick<AppState, keyof ObservedAppState>>;
-  queue: DraftSceneUpdate[];
-  pendingCanvasFields: Set<keyof ObservedAppState>;
-};
-
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null &&
   typeof value === "object" &&
@@ -533,6 +513,18 @@ const hasElementFieldChange = (previous: unknown, next: unknown): boolean => {
 
 const isElementVersionField = (key: string) =>
   key === "version" || key === "versionNonce" || key === "updated";
+
+const hasElementContentChange = (
+  previous: ExcalidrawElement,
+  next: ExcalidrawElement,
+) =>
+  Delta.getDifferences(previous, next, true).some((key) => {
+    const prop = key as keyof ExcalidrawElement;
+    return (
+      !isElementVersionField(key) &&
+      hasElementFieldChange(previous[prop], next[prop])
+    );
+  });
 
 const isUIConfig = (ui: AppProps["ui"]): ui is UIConfig =>
   typeof ui === "object" && ui !== null;
@@ -844,7 +836,9 @@ class App extends React.Component<AppProps, AppState> {
   /** offsets of `elementRenderOverrides`; keeps its identity while they don't change */
   private elementRenderOffsets: ElementRenderOffsets = new Map();
   private renderOverridesUpdatePending = false;
-  private draftSceneCapture: DraftSceneCapture | null = null;
+  private pendingDraftAppState: Partial<
+    Pick<AppState, keyof ObservedAppState>
+  > | null = null;
 
   private getRenderOverrideConfig = () => ({
     elementRenderOverrides: this.elementRenderOverrides,
@@ -3209,48 +3203,45 @@ class App extends React.Component<AppProps, AppState> {
     });
   };
 
-  // Action results often spread their input state. Give them the queued values
-  // so a same-batch edit can explicitly restore an earlier value.
+  // Action results can spread their input state, including values written
+  // earlier in the React batch. History baselines are owned by Store.
   private getActionAppState = (): AppState =>
-    this.draftSceneCapture
-      ? { ...this.state, ...this.draftSceneCapture.updates }
+    this.pendingDraftAppState
+      ? { ...this.state, ...this.pendingDraftAppState }
       : this.state;
 
-  private queueDraftSceneUpdate(
-    source: "action" | "updateScene",
+  private trackDraftAppState(appState: Partial<AppState>) {
+    const current = this.getActionAppState();
+    const state = { ...current, ...appState };
+    const observed = getObservedAppState(state);
+    const updates: Partial<ObservedAppState> = {};
+    for (const key of Object.keys(observed) as (keyof ObservedAppState)[]) {
+      if (Object.prototype.hasOwnProperty.call(appState, key)) {
+        Object.assign((this.pendingDraftAppState ??= {}), {
+          [key]: state[key],
+        });
+        const value = observed[key];
+        Object.assign(updates, {
+          [key]: value && typeof value === "object" ? { ...value } : value,
+        });
+      }
+    }
+    return { current, updates };
+  }
+
+  private scheduleDraftSceneUpdate(
     appState: Partial<AppState>,
     action?: CaptureUpdateActionType,
     elements?: SceneData["elements"],
   ) {
-    const current = this.getActionAppState();
-    const state = { ...current, ...appState };
-    const observed = getObservedAppState(state);
-    const keys = (Object.keys(observed) as (keyof ObservedAppState)[]).filter(
-      (key) => Object.prototype.hasOwnProperty.call(appState, key),
-    );
     const draft = this.text.newShapeLabelDraft;
-    if (!keys.length && !(elements && (action || draft))) {
-      return;
-    }
-
-    const capture: DraftSceneCapture = (this.draftSceneCapture ??= {
-      labelId: draft?.labelId,
-      updates: {},
-      queue: [],
-      pendingCanvasFields: new Set(),
-    });
-    for (const key of keys) {
-      Object.assign(capture.updates, { [key]: state[key] });
-    }
-    if (source === "action" && action === CaptureUpdateAction.IMMEDIATELY) {
-      for (const key of keys) {
-        capture.pendingCanvasFields.add(key);
-      }
-      return;
-    }
-
+    const labelId = draft?.labelId;
+    const { current, updates } = this.trackDraftAppState(appState);
     let change: StoreChange = { elements: {}, appState: {} };
-    const elementPatches: DraftSceneUpdate["elementPatches"] = new Map();
+    const elementPatches = new Map<
+      string,
+      { element: OrderedExcalidrawElement; versionIncrement: number }
+    >();
     if (elements && (draft || action)) {
       // Compute the element change against the live scene at the time of the
       // call. The scene can still contain the unsaved label and resize.
@@ -3347,148 +3338,168 @@ class App extends React.Component<AppProps, AppState> {
     if (!action) {
       return;
     }
-    const update: DraftSceneUpdate = { action, change, elementPatches };
-
-    if (action === CaptureUpdateAction.EVENTUALLY) {
-      update.previousAppState = getObservedAppState(current);
-    }
-
-    for (const key of keys) {
-      Object.assign(update.change.appState, { [key]: observed[key] });
-    }
-
-    capture.queue.push(update);
-  }
-
-  private scheduleDraftSceneUpdates(capture: DraftSceneCapture) {
-    let committed = this.store.snapshot;
-    const { labelId } = capture;
-    const draftLabelId =
-      labelId && !committed.elements.has(labelId) ? labelId : undefined;
-    for (const update of capture.queue) {
-      const { action, change, elementPatches, previousAppState } = update;
-
-      const elements: StoreChange["elements"] = {};
-      for (const [id, element] of Object.entries(change.elements)) {
-        if (action === CaptureUpdateAction.EVENTUALLY) {
-          elements[id] = element;
-          continue;
-        }
-        if (id === draftLabelId) {
-          continue;
-        }
-        const before = committed.elements.get(id);
-        const patch = elementPatches.get(id);
-        if (!before || !patch) {
-          if (before && element.version <= before.version) {
+    const previousAppState =
+      action === CaptureUpdateAction.EVENTUALLY
+        ? getObservedAppState(current)
+        : undefined;
+    this.store.scheduleMicroAction({
+      action,
+      resolveChange: (committed) => {
+        const draftLabelId =
+          labelId && !committed.elements.has(labelId) ? labelId : undefined;
+        const elements: StoreChange["elements"] = {};
+        for (const [id, element] of Object.entries(change.elements)) {
+          if (action === CaptureUpdateAction.EVENTUALLY) {
+            elements[id] = element;
             continue;
           }
-          const bindings = element.boundElements;
-          const filtered = bindings?.filter(({ id }) => id !== draftLabelId);
-          elements[id] =
-            filtered && filtered.length !== bindings?.length
-              ? newElementWith(element, {
-                  boundElements: filtered.length ? filtered : null,
-                  version: Math.max(
-                    element.version,
-                    (before?.version ?? 0) + 1,
-                  ),
-                })
-              : element;
-          continue;
+          if (id === draftLabelId) {
+            continue;
+          }
+          const before = committed.elements.get(id);
+          const patch = elementPatches.get(id);
+          if (!before || !patch) {
+            if (before && element.version <= before.version) {
+              continue;
+            }
+            const bindings = element.boundElements;
+            const filtered = bindings?.filter(({ id }) => id !== draftLabelId);
+            elements[id] =
+              filtered && filtered.length !== bindings?.length
+                ? newElementWith(element, {
+                    boundElements: filtered.length ? filtered : null,
+                    version: Math.max(
+                      element.version,
+                      (before?.version ?? 0) + 1,
+                    ),
+                  })
+                : element;
+            continue;
+          }
+
+          if (hasElementContentChange(before, patch.element)) {
+            // Advance only by this call's changes so the draft still has a
+            // newer version when it is submitted.
+            const version = before.version + patch.versionIncrement;
+            const matchesIncoming =
+              version === element.version &&
+              !hasElementContentChange(patch.element, element);
+
+            // Different versions of the content must not share a nonce or
+            // ElementsDelta can miss the pending changes on label submission.
+            elements[id] = matchesIncoming
+              ? element
+              : newElementWith(before, {
+                  ...patch.element,
+                  version,
+                  versionNonce: undefined,
+                });
+          }
         }
 
-        const changed = Delta.getDifferences(before, patch.element, true).some(
-          (key) => {
-            const prop = key as keyof OrderedExcalidrawElement;
-            return (
-              !isElementVersionField(key) &&
-              hasElementFieldChange(before[prop], patch.element[prop])
-            );
-          },
+        const previous = previousAppState
+          ? StoreSnapshot.create(committed.elements, previousAppState)
+          : committed;
+        const next = StoreSnapshot.create(
+          committed.elements,
+          getObservedAppState({ ...previous.appState, ...updates }),
         );
-        if (changed) {
-          // Advance only by this call's changes so the draft still has a
-          // newer version when it is submitted.
-          const version = before.version + patch.versionIncrement;
-          const matchesIncoming =
-            version === element.version &&
-            !Delta.getDifferences(patch.element, element, true).some((key) => {
-              const prop = key as keyof OrderedExcalidrawElement;
-              return (
-                !isElementVersionField(key) &&
-                hasElementFieldChange(patch.element[prop], element[prop])
-              );
-            });
+        const appState = next.getChangedAppState(previous);
+        return Object.keys(elements).length || Object.keys(appState).length
+          ? { elements, appState }
+          : null;
+      },
+    });
+  }
 
-          // Different versions of the content must not share a nonce or
-          // ElementsDelta can miss the pending changes on label submission.
-          elements[id] = matchesIncoming
-            ? element
-            : newElementWith(before, {
-                ...patch.element,
-                version,
-                versionNonce: undefined,
-              });
-        }
-      }
-
-      const previous = previousAppState
-        ? StoreSnapshot.create(committed.elements, previousAppState)
-        : committed;
-      const next = previous.applyChange({
-        elements,
-        appState: change.appState,
-      });
-      const committedChange = {
-        elements,
-        appState: next.getChangedAppState(previous),
-      };
-      if (
-        !Object.keys(elements).length &&
-        !Object.keys(committedChange.appState).length
-      ) {
+  private projectDraftElements(
+    elements: SceneElementsMap,
+    draft: NonNullable<AppText["newShapeLabelDraft"]>,
+    committed?: StoreSnapshot,
+  ) {
+    const { labelId } = draft;
+    const projected = new Map(elements) as SceneElementsMap;
+    if (labelId) {
+      projected.delete(labelId);
+    }
+    for (const [id, live] of projected) {
+      const host = draft.elements.get(id);
+      const bindings = (host ?? live).boundElements;
+      const filtered = bindings?.filter((binding) => binding.id !== labelId);
+      if (!host && filtered?.length === bindings?.length) {
         continue;
       }
-      if (action === CaptureUpdateAction.IMMEDIATELY) {
-        this.store.scheduleMicroAction({
-          action,
-          change: committedChange,
-          delta: StoreDelta.calculate(previous, next),
-        });
-      } else {
-        this.store.scheduleMicroAction({
-          action,
-          change: committedChange,
-        });
+
+      // The host values include updates made during editing, without the
+      // container and arrow layout authored by the text editor.
+      const element = {
+        ...live,
+        ...host,
+        index: live.index,
+        isDeleted: live.isDeleted,
+        boundElements:
+          filtered?.length === bindings?.length
+            ? bindings
+            : filtered?.length
+            ? filtered
+            : null,
+      };
+      const previous = committed?.elements.get(id);
+      if (previous && !hasElementContentChange(previous, element)) {
+        projected.set(id, previous);
+      } else if (hasElementContentChange(live, element)) {
+        projected.set(
+          id,
+          newElementWith(
+            element,
+            {
+              version: committed
+                ? Math.max(element.version, (previous?.version ?? 0) + 1)
+                : live.version + 1,
+            },
+            true,
+          ),
+        );
       }
-      if (action !== CaptureUpdateAction.EVENTUALLY) {
-        committed = next;
-      }
+    }
+    return projected;
+  }
+
+  private discardInvalidShapeLabel() {
+    const draft = this.text.newShapeLabelDraft;
+    if (!draft || !this.text.discardInvalidShapeLabel()) {
+      return;
     }
 
-    // Store runs explicit scene captures before the batch-end capture. Keep
-    // that order for canvas state without including unsubmitted label elements.
-    if (capture.pendingCanvasFields.size) {
-      const finalAppState = getObservedAppState(this.state);
-      const next = committed.applyChange({
-        elements: {},
-        appState: Object.fromEntries(
-          [...capture.pendingCanvasFields].map((key) => [
-            key,
-            finalAppState[key],
-          ]),
-        ),
-      });
-      const appState = next.getChangedAppState(committed);
-      if (Object.keys(appState).length) {
-        this.store.scheduleMicroAction({
-          action: CaptureUpdateAction.IMMEDIATELY,
-          change: { elements: {}, appState },
-          delta: StoreDelta.calculate(committed, next),
-        });
-      }
+    this.pendingDraftAppState = null;
+    this.setState({ editingTextElement: null, newElement: null });
+    if (!draft.labelId || this.scene.getNonDeletedElement(draft.labelId)) {
+      return;
     }
+
+    // A host can remove the label while echoing the editor's live layout.
+    // Restore the draft-free elements before the rest of this batch captures.
+    const live = this.scene.getElementsMapIncludingDeleted();
+    const projected = this.projectDraftElements(live, draft);
+    const restored = [...projected.values()]
+      .filter((element) => live.get(element.id) !== element)
+      .map((element) => deepCopyElement(element));
+    this.store.scheduleMicroAction({
+      action: CaptureUpdateAction.NEVER,
+      resolveChange: (snapshot) => {
+        const elements: StoreChange["elements"] = {};
+        for (const element of restored) {
+          const committed = snapshot.elements.get(element.id);
+          if (committed && !hasElementContentChange(committed, element)) {
+            elements[element.id] = element;
+          }
+        }
+        // Keep revision bumps from draft cleanup out of undo without
+        // absorbing any independent host edits into this update.
+        return Object.keys(elements).length ? { elements, appState: {} } : null;
+      },
+    });
+    this.scene.replaceAllElements([...projected.values()]);
   }
 
   public syncActionResult = withBatchedUpdates((actionResult: ActionResult) => {
@@ -3496,16 +3507,13 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    const currentEditingText = this.state.editingTextElement;
-    const isEditingNewShapeLabel =
-      currentEditingText &&
-      this.text.isEditingNewShapeLabel(currentEditingText.id);
+    const draft = this.text.newShapeLabelDraft;
     // Open File returns a file map even when no files need replacing.
     const replacingScene =
       !!actionResult.elements &&
       actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY &&
       (actionResult.replaceFiles || !!actionResult.files);
-    const discardingShapeLabel = isEditingNewShapeLabel && replacingScene;
+    const discardingShapeLabel = draft && replacingScene;
     if (discardingShapeLabel) {
       this.text.discardNewShapeLabel();
     }
@@ -3529,13 +3537,7 @@ class App extends React.Component<AppProps, AppState> {
           : null;
     }
 
-    const captureDraftAppState =
-      isEditingNewShapeLabel || this.draftSceneCapture;
-    const captureAppStateSeparately =
-      captureDraftAppState &&
-      !actionResult.elements &&
-      actionResult.captureUpdate !== CaptureUpdateAction.EVENTUALLY;
-    if (captureDraftAppState && actionResult.appState) {
+    if ((draft || this.pendingDraftAppState) && actionResult.appState) {
       const state = this.getActionAppState();
       const current = getObservedAppState(state);
       const next = getObservedAppState({
@@ -3546,37 +3548,24 @@ class App extends React.Component<AppProps, AppState> {
       const changedKeys = new Set(Delta.getRightDifferences(current, next));
       actionAppState = { ...actionAppState };
       for (const key of Object.keys(current) as (keyof ObservedAppState)[]) {
-        const confirmsBackground =
-          key === "viewBackgroundColor" &&
-          captureAppStateSeparately &&
-          actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY &&
-          current.viewBackgroundColor !==
-            this.store.snapshot.appState.viewBackgroundColor;
-        if (!changedKeys.has(key) && !confirmsBackground) {
-          // Actions often return a copy of the state they were given. Keep
-          // those fields out of both the React update and the history capture.
+        if (!changedKeys.has(key)) {
+          // Action results often echo unchanged fields from their input.
           delete actionAppState[key];
         }
       }
-      this.queueDraftSceneUpdate(
-        "action",
-        actionAppState,
-        captureAppStateSeparately ? actionResult.captureUpdate : undefined,
-      );
+      this.trackDraftAppState(actionAppState);
     }
-    if (!captureAppStateSeparately) {
-      // Leave property edits (including font preview resets) in the draft so
-      // submit can capture the shape resize with the final label or its cleanup.
-      const deferCapture =
-        isEditingNewShapeLabel &&
-        actionResult.elements &&
-        editingTextElement?.id === currentEditingText.id;
-      this.store.scheduleAction(
-        deferCapture
-          ? CaptureUpdateAction.EVENTUALLY
-          : actionResult.captureUpdate,
-      );
-    }
+
+    // Leave text property edits in the draft until the label is submitted.
+    const deferCapture =
+      actionResult.elements &&
+      editingTextElement &&
+      editingTextElement.id === draft?.labelId;
+    this.store.scheduleAction(
+      deferCapture
+        ? CaptureUpdateAction.EVENTUALLY
+        : actionResult.captureUpdate,
+    );
 
     let didUpdate = false;
 
@@ -3981,6 +3970,8 @@ class App extends React.Component<AppProps, AppState> {
    */
   private resetScene = withBatchedUpdates(
     (opts?: { resetLoadingState: boolean }) => {
+      this.text.discardNewShapeLabel();
+      this.pendingDraftAppState = null;
       this.elementRenderOverrides = new Map();
       this.elementRenderOffsets = new Map();
       this.scene.replaceAllElements([]);
@@ -4331,6 +4322,7 @@ class App extends React.Component<AppProps, AppState> {
   }
 
   public componentWillUnmount() {
+    this.text.discardNewShapeLabel();
     // we're recreating the api object reference so that the
     // <ExcalidrawAPIContext.Provider/> picks up on it
     this.api = { ...this.api, isDestroyed: true };
@@ -4732,11 +4724,7 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    const draftSceneCapture = this.draftSceneCapture;
-    this.draftSceneCapture = null;
-    if (draftSceneCapture) {
-      this.scheduleDraftSceneUpdates(draftSceneCapture);
-    }
+    this.pendingDraftAppState = null;
 
     // must be updated *before* state change listeners are triggered below
     if (!this._initialized && !this.state.isLoading) {
@@ -4758,6 +4746,7 @@ class App extends React.Component<AppProps, AppState> {
 
     this.appStateObserver.flush(prevState);
 
+    this.discardInvalidShapeLabel();
     this.updateEmbeddables();
     const elements = this.scene.getElementsIncludingDeleted();
     const elementsMap = this.scene.getElementsMapIncludingDeleted();
@@ -4931,7 +4920,15 @@ class App extends React.Component<AppProps, AppState> {
       this.setState({ scrolledOutside });
     }
 
-    this.store.commit(elementsMap, this.state);
+    const draft = this.text.newShapeLabelDraft;
+    this.store.commit(
+      elementsMap,
+      this.state,
+      draft
+        ? (committed) =>
+            this.projectDraftElements(elementsMap, draft, committed)
+        : undefined,
+    );
 
     // Do not notify consumers if we're still loading the scene. Among other
     // potential issues, this fixes a case where the tab isn't focused during
@@ -5482,13 +5479,8 @@ class App extends React.Component<AppProps, AppState> {
     }) => {
       const { elements, appState, collaborators, captureUpdate } = sceneData;
 
-      if (this.draftSceneCapture || this.text.newShapeLabelDraft) {
-        this.queueDraftSceneUpdate(
-          "updateScene",
-          appState ?? {},
-          captureUpdate,
-          elements,
-        );
+      if (this.pendingDraftAppState || this.text.newShapeLabelDraft) {
+        this.scheduleDraftSceneUpdate(appState ?? {}, captureUpdate, elements);
       } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;
         const observedAppState = appState
@@ -5511,6 +5503,7 @@ class App extends React.Component<AppProps, AppState> {
 
       if (elements) {
         this.scene.replaceAllElements(elements);
+        this.discardInvalidShapeLabel();
       }
 
       if (collaborators) {
@@ -11465,13 +11458,12 @@ class App extends React.Component<AppProps, AppState> {
         }
         // Keep the old and new fractional indices distinct on undo, without
         // capturing the index repair as an edit.
-        if (this.draftSceneCapture || this.text.newShapeLabelDraft) {
+        if (this.text.newShapeLabelDraft) {
           const previous = this.scene
             .getElementsIncludingDeleted()
             .map((element) => ({ ...element }));
           syncInvalidIndices(previous.concat(ret.data.elements));
-          this.queueDraftSceneUpdate(
-            "updateScene",
+          this.scheduleDraftSceneUpdate(
             {},
             CaptureUpdateAction.NEVER,
             previous,

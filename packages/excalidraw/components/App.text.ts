@@ -15,6 +15,7 @@ import {
 import { pointFrom, type Radians } from "@excalidraw/math";
 
 import {
+  CaptureUpdateAction,
   DEFAULT_BOUND_TEXT_LABEL_POSITION,
   deepCopyElement,
   fixBindingsAfterDeletion,
@@ -41,10 +42,11 @@ import {
   newElementWith,
   newTextElement,
   refreshTextDimensions,
+  StoreChange,
   updateBoundElements,
 } from "@excalidraw/element";
 
-import type { ArrowEndpoint } from "@excalidraw/element";
+import type { ArrowEndpoint, StoreSnapshot } from "@excalidraw/element";
 import type {
   ExcalidrawElement,
   ExcalidrawTextContainer,
@@ -108,10 +110,29 @@ export class AppText {
 
   public discardNewShapeLabel() {
     if (this.shapeLabelDraft) {
-      this.textEditor?.discard();
+      const editor = this.textEditor;
       this.textEditor = null;
       this.shapeLabelDraft = null;
+      editor?.discard();
     }
+  }
+
+  public discardInvalidShapeLabel() {
+    const draft = this.shapeLabelDraft;
+    if (!draft?.labelId) {
+      return false;
+    }
+    const label = this.app.scene.getNonDeletedElement(draft.labelId);
+    if (
+      label &&
+      isTextElement(label) &&
+      label.containerId === draft.containerId &&
+      this.app.scene.getNonDeletedElement(draft.containerId)
+    ) {
+      return false;
+    }
+    this.discardNewShapeLabel();
+    return true;
   }
 
   private getTextCreationGridPoint = (x: number, y: number) => {
@@ -212,11 +233,9 @@ export class AppText {
       initialSelection?: { start: number; end: number } | null;
     },
   ) {
-    const elementsMap = this.app.scene.getElementsMapIncludingDeleted();
-
     const updateElement = (nextOriginalText: string, isDeleted: boolean) => {
-      const latestTextElement =
-        this.app.scene.getElement<ExcalidrawTextElement>(element.id);
+      const elementsMap = this.app.scene.getElementsMapIncludingDeleted();
+      const latestTextElement = this.app.scene.getNonDeletedElement(element.id);
 
       if (!latestTextElement || !isTextElement(latestTextElement)) {
         return;
@@ -348,24 +367,6 @@ export class AppText {
             ? element.containerId || (!isDeleted ? element.id : null)
             : null;
 
-        if (elementIdToSelect) {
-          // needed to ensure state is updated before "finalize" action
-          // that's invoked on keyboard-submit as well
-          // TODO either move this into finalize as well, or handle all state
-          // updates in one place, skipping finalize action
-          flushSync(() => {
-            this.app.setState((prevState) => ({
-              selectedElementIds: makeNextSelectedElementIds(
-                {
-                  ...prevState.selectedElementIds,
-                  [elementIdToSelect]: true,
-                },
-                prevState,
-              ),
-            }));
-          });
-        }
-
         if (isDeleted) {
           fixBindingsAfterDeletion(this.app.scene.getNonDeletedElements(), [
             element,
@@ -374,39 +375,50 @@ export class AppText {
 
         // A new empty label can still leave its shape resized. Capture that
         // change only if the size differs from the store's snapshot.
-        const container =
-          isDeleted && !isExistingElement && element.containerId
-            ? this.app.scene.getNonDeletedElement(element.containerId)
-            : null;
-        const previousContainer = container
-          ? this.app.store.snapshot.elements.get(container.id)
-          : null;
-        const didResizeContainer =
-          container &&
-          !isArrowElement(container) &&
-          !isStickyNoteElement(container) &&
-          previousContainer &&
-          !previousContainer.isDeleted &&
-          (container.width !== previousContainer.width ||
-            container.height !== previousContainer.height);
-
-        if (didResizeContainer) {
-          // History redraws bound arrows, so capture their updated geometry too.
-          updateBoundElements(container, this.app.scene, {
-            renderEnvironment: this.app.renderEnvironment,
-          });
-        }
-
+        const draft = this.shapeLabelDraft;
         this.shapeLabelDraft = null;
-        if (!isDeleted || isExistingElement || didResizeContainer) {
+        if (!isDeleted || isExistingElement) {
           this.app.store.scheduleCapture();
+        } else if (draft) {
+          const container = this.app.scene.getNonDeletedElement(
+            draft.containerId,
+          );
+          if (container) {
+            const { id, width, height } = container;
+            const resizedFrom = (previous: ExcalidrawElement | undefined) =>
+              !!previous &&
+              !previous.isDeleted &&
+              (width !== previous.width || height !== previous.height);
+            const didResize = (snapshot: StoreSnapshot) =>
+              resizedFrom(snapshot.elements.get(id));
+            if (
+              didResize(this.app.store.snapshot) ||
+              resizedFrom(draft.elements.get(id))
+            ) {
+              updateBoundElements(container, this.app.scene, {
+                renderEnvironment: this.app.renderEnvironment,
+              });
+            }
+            this.app.store.scheduleCapture(didResize);
+          }
         }
 
+        // Apply keyboard selection before the finalize action, as part of
+        // the same commit as the label and its binding cleanup.
         flushSync(() => {
-          this.app.setState({
+          this.app.setState((prevState) => ({
             newElement: null,
             editingTextElement: null,
-          });
+            selectedElementIds: elementIdToSelect
+              ? makeNextSelectedElementIds(
+                  {
+                    ...prevState.selectedElementIds,
+                    [elementIdToSelect]: true,
+                  },
+                  prevState,
+                )
+              : prevState.selectedElementIds,
+          }));
         });
 
         // tools that survive the submit (locked, or autoshape's
@@ -433,6 +445,25 @@ export class AppText {
     });
     // deselect all other elements when inserting text
     this.app.selection.clear();
+    if (this.isEditingNewShapeLabel(element.id)) {
+      // Opening the editor clears its selection as part of the draft. This
+      // must not produce a selection-only undo entry at a later canvas action.
+      this.app.store.scheduleMicroAction({
+        action: CaptureUpdateAction.NEVER,
+        resolveChange: (snapshot) => {
+          const next = snapshot.applyChange({
+            elements: {},
+            appState: {
+              selectedElementIds: {},
+              selectedGroupIds: {},
+              editingGroupId: null,
+            },
+          });
+          const change = StoreChange.create(snapshot, next);
+          return Object.keys(change.appState).length ? change : null;
+        },
+      });
+    }
     // (the linear element editor stays up, to come back to on submit — but
     // without the hover affordances, which are for the selection)
     if (this.app.state.selectedLinearElement) {

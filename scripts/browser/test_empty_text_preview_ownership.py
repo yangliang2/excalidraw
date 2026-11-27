@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,10 @@ CHECKER = Path(__file__).with_name('empty-text-history.mjs')
 MARKER = 'preview-marker.txt'
 TOKEN = 'fixture-preview-token'
 RESOURCE_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.ENOBUFS, errno.EAGAIN}
+NODE_RESOURCE_CODES = {
+    errno.errorcode[number]
+    for number in RESOURCE_ERRNOS | {errno.EACCES, errno.EPERM, errno.ENOSPC, errno.EROFS}
+}
 
 PLAYWRIGHT_FIXTURE = """
 import { EventEmitter } from 'node:events';
@@ -117,6 +122,12 @@ def run_node(operation, command, **kwargs):
         raise ProtocolEnvironmentError(
             f'{operation}: terminated by signal {-result.returncode}',
         )
+    if result.returncode == 2:
+        # Exit 2 is also expected when the checker rejects an unowned preview.
+        # A Node system error identifies a resource failure inside the child.
+        resource_error = re.search(r"^ *code: '([A-Z]+)',?$", result.stderr, re.MULTILINE)
+        if resource_error and resource_error[1] in NODE_RESOURCE_CODES:
+            raise ProtocolEnvironmentError(f'{operation}: {result.stderr.strip()}')
     return result
 
 
@@ -316,6 +327,8 @@ class ProtocolClassificationTests(unittest.TestCase):
             (None, 0),
             ('accept', 2),
             ('handle', 2),
+            ('import-marker-write', 2),
+            ('unexpected-rejection', 1),
         ):
             with self.subTest(failure=failure):
                 error = OSError(errno.EMFILE, 'simulated request resource failure')
@@ -345,6 +358,16 @@ class ProtocolClassificationTests(unittest.TestCase):
 
                 def run(command, *, env, **kwargs):
                     server._handle_request_noblock()
+                    if failure == 'import-marker-write':
+                        return subprocess.CompletedProcess(
+                            command, 2, stdout='',
+                            stderr="Error: simulated ENOSPC writing import marker\n  code: 'ENOSPC',\n",
+                        )
+                    if failure == 'unexpected-rejection':
+                        return subprocess.CompletedProcess(
+                            command, 2, stdout='',
+                            stderr="Error: Preview did not return this build's readiness marker\n",
+                        )
                     if any(call.args == (TOKEN.encode(),) for call in request.sendall.call_args_list):
                         Path(env['IMPORT_SENTINEL']).touch()
                     return subprocess.CompletedProcess(command, 2, stderr='')

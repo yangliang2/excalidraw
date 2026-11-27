@@ -240,6 +240,87 @@ describe("label draft transaction boundaries", () => {
       height: 10,
     });
   });
+
+  it.each(["remove", "soft-delete"])(
+    "cleans up the empty label when the host invalidates its container: %s",
+    async (operation) => {
+      await render(<Excalidraw handleKeyboardGlobally />);
+      const { container, editor } = await openEmptyLabel(10);
+      const containerId = container.id;
+      const labelId = h.state.editingTextElement!.id;
+
+      act(() => {
+        h.app.updateScene({
+          elements: h.app.scene.getElementsIncludingDeleted().flatMap((el) => {
+            if (el.id !== containerId) {
+              return [el];
+            }
+            return operation === "remove"
+              ? []
+              : [newElementWith(el, { isDeleted: true })];
+          }),
+          captureUpdate: CaptureUpdateAction.NEVER,
+        });
+      });
+      if (editor.isConnected) {
+        Keyboard.exitTextEditor(editor);
+      }
+
+      expect(h.state.editingTextElement).toBeNull();
+      expect(h.app.scene.getNonDeletedElements()).toEqual([]);
+      expect(h.store.snapshot.elements.get(labelId)?.isDeleted).not.toBe(false);
+    },
+  );
+
+  it("keeps a host-detached nonempty label through background undo and redo", async () => {
+    await render(<Excalidraw handleKeyboardGlobally />);
+    const { container, editor, originalColor } = await openEmptyLabel(10);
+    const containerId = container.id;
+    updateTextEditor(editor, "Detached text");
+    const labelId = h.state.editingTextElement!.id;
+
+    act(() => {
+      h.app.updateScene({
+        elements: h.app.scene.getElementsIncludingDeleted().map((el) => {
+          if (el.id === labelId && el.type === "text") {
+            return newElementWith(el, { containerId: null });
+          }
+          return el.id === containerId
+            ? newElementWith(el, { boundElements: null })
+            : el;
+        }),
+        captureUpdate: CaptureUpdateAction.NEVER,
+      });
+    });
+    if (editor.isConnected) {
+      Keyboard.exitTextEditor(editor);
+    }
+
+    const expected = { containerId: null, originalText: "Detached text" };
+    expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject(expected);
+    expect(h.store.snapshot.elements.get(labelId)).toMatchObject(expected);
+
+    act(() =>
+      h.app.actionManager.executeAction(
+        actionChangeViewBackgroundColor,
+        "api",
+        {
+          viewBackgroundColor: red,
+        },
+      ),
+    );
+    for (const [apply, color] of [
+      [() => Keyboard.undo(), originalColor],
+      [() => Keyboard.redo(), red],
+    ] as const) {
+      apply();
+      expect(h.state.viewBackgroundColor).toBe(color);
+      expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject(expected);
+      expect(
+        h.app.scene.getNonDeletedElement(containerId)?.boundElements ?? [],
+      ).toEqual([]);
+    }
+  });
 });
 
 describe.each([false, true])(

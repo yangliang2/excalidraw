@@ -3353,7 +3353,13 @@ class App extends React.Component<AppProps, AppState> {
             elements[id] = element;
             continue;
           }
-          if (id === draftLabelId) {
+          // An explicit host detach makes this text independent of the draft.
+          if (
+            id === draftLabelId &&
+            (element.isDeleted ||
+              !isTextElement(element) ||
+              element.containerId !== null)
+          ) {
             continue;
           }
           const before = committed.elements.get(id);
@@ -3473,12 +3479,20 @@ class App extends React.Component<AppProps, AppState> {
 
     this.pendingDraftAppState = null;
     this.setState({ editingTextElement: null, newElement: null });
-    if (!draft.labelId || this.scene.getNonDeletedElement(draft.labelId)) {
+    const label = draft.labelId
+      ? this.scene.getNonDeletedElement(draft.labelId)
+      : null;
+    if (
+      label &&
+      (!isTextElement(label) ||
+        label.containerId !== draft.containerId ||
+        label.originalText.trim())
+    ) {
       return;
     }
 
-    // A host can remove the label while echoing the editor's live layout.
-    // Restore the draft-free elements before the rest of this batch captures.
+    // Remove the empty orphan if the host removed its container. When the host
+    // removed the label instead, also undo the layout it may have echoed.
     const live = this.scene.getElementsMapIncludingDeleted();
     const projected = this.projectDraftElements(live, draft);
     const restored = [...projected.values()]

@@ -414,6 +414,11 @@ export const textWysiwyg = ({
             }
           }
 
+          // A resize supplied during editing sets a floor for auto-shrink.
+          const draft = app.text.newShapeLabelDraft;
+          const hostHeight =
+            draft?.containerId === container.id ? draft.hostHeight : undefined;
+
           // autogrow container height if text exceeds
           if (!isArrowElement(container) && height > maxHeight) {
             const targetContainerHeight = computeContainerDimensionForBoundText(
@@ -432,12 +437,13 @@ export const textWysiwyg = ({
             // autoshrink container height until original container height
             // is reached when text is removed
             !isArrowElement(container) &&
-            container.height > originalContainerData.height &&
+            container.height >
+              Math.max(originalContainerData.height, hostHeight ?? 0) &&
             height < maxHeight
           ) {
-            const targetContainerHeight = computeContainerDimensionForBoundText(
-              height,
-              container.type,
+            const targetContainerHeight = Math.max(
+              computeContainerDimensionForBoundText(height, container.type),
+              hostHeight ?? 0,
             );
             app.scene.mutateElement(container, {
               height: targetContainerHeight,

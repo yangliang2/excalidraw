@@ -72,6 +72,9 @@ type AppTextDependencies = {
 type ShapeLabelDraft = {
   labelId?: string;
   containerId: string;
+  // The most recent authored host revision, including uncaptured updates.
+  hostLabel?: ExcalidrawTextElement;
+  hostHeight?: number;
   // Values before the editor's layout writes, updated only by host scene writes.
   elements: Map<string, ExcalidrawElement>;
 };
@@ -397,8 +400,7 @@ export class AppText {
           ]);
         }
 
-        // A new empty label can still leave its shape resized. Capture that
-        // change only if the size differs from the store's snapshot.
+        // An empty label can still leave its shape resized by the editor.
         const draft = this.shapeLabelDraft;
         this.shapeLabelDraft = null;
         if (draft) {
@@ -411,14 +413,13 @@ export class AppText {
             !previous.isDeleted &&
             (container.width !== previous.width ||
               container.height !== previous.height);
+          const editorResized = resizedFrom(
+            draft.elements.get(draft.containerId),
+          );
           const didResize = (snapshot: StoreSnapshot) =>
+            editorResized &&
             resizedFrom(snapshot.elements.get(draft.containerId));
-          if (
-            isDeleted &&
-            container &&
-            (didResize(this.app.store.snapshot) ||
-              resizedFrom(draft.elements.get(draft.containerId)))
-          ) {
+          if (isDeleted && container && editorResized) {
             updateBoundElements(container, this.app.scene, {
               renderEnvironment: this.app.renderEnvironment,
             });

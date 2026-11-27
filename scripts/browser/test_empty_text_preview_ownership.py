@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -326,6 +327,31 @@ class BrowserFailureTests(unittest.TestCase):
 
 
 class ProtocolClassificationTests(unittest.TestCase):
+    def test_frozen_fixture_temp_failures_exit_two_through_discovery(self):
+        directory = tempfile.TemporaryDirectory
+
+        def fail_cleanup(instance):
+            cleanup(instance)
+            raise OSError(errno.EIO, 'simulated frozen fixture cleanup failure')
+
+        cleanup = directory.cleanup
+        for fault, expected in (('create', 2), ('cleanup', 2), (None, 0)):
+            with self.subTest(fault=fault), patch.object(
+                unittest.TestLoader, 'testNamePatterns', ['*.test_success_stops_server'],
+            ), redirect_stderr(io.StringIO()) as log:
+                if fault == 'create':
+                    with patch.object(tempfile, 'TemporaryDirectory', side_effect=OSError(
+                        errno.ENOSPC, 'simulated frozen fixture creation failure',
+                    )):
+                        code = run_protocol_tests()
+                elif fault == 'cleanup':
+                    with patch.object(directory, 'cleanup', autospec=True, side_effect=fail_cleanup):
+                        code = run_protocol_tests()
+                else:
+                    code = run_protocol_tests()
+                self.assertIn('Ran 1 test', log.getvalue())
+                self.assertEqual(code, expected, log.getvalue())
+
     def test_node_signals_exit_two(self):
         for returncode in (-9, -15):
             with self.subTest(returncode=returncode), patch(
@@ -488,7 +514,13 @@ def run_protocol_tests():
         str(Path(__file__).resolve().parent), pattern='test_empty_text_production.py',
     )
     suite.addTests(loader.loadTestsFromModule(sys.modules[__name__]))
-    result = unittest.TextTestRunner(verbosity=2, resultclass=ProtocolTestResult).run(suite)
+    # The frozen fixtures create their own temporary directories. Adapt their
+    # resource boundary without changing the fixtures or process-wide tempfile.
+    fixture_tempfile = SimpleNamespace(
+        TemporaryDirectory=lambda: fixture_directory('production protocol'),
+    )
+    with patch.object(sys.modules['test_empty_text_production'], 'tempfile', fixture_tempfile):
+        result = unittest.TextTestRunner(verbosity=2, resultclass=ProtocolTestResult).run(suite)
     return result.exit_code()
 
 

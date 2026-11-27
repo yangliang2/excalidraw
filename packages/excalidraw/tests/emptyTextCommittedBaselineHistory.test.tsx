@@ -76,6 +76,157 @@ describe("label draft transaction boundaries", () => {
 
   const startLabel = () => new Pointer("mouse").doubleClickAt(300, 300);
 
+  it.each([200, 250])(
+    "does not record a host-only resize to 250×%s when an empty label is submitted",
+    async (height) => {
+      await render(<Excalidraw handleKeyboardGlobally />);
+      const { container, editor } = await openEmptyLabel();
+      const undoDepth = h.history.undoStack.length;
+      act(() =>
+        h.app.updateScene({
+          elements: h.app.scene
+            .getElementsIncludingDeleted()
+            .map((element) =>
+              element.id === container.id
+                ? newElementWith(element, { width: 250, height })
+                : element,
+            ),
+          captureUpdate: CaptureUpdateAction.EVENTUALLY,
+        }),
+      );
+      Keyboard.exitTextEditor(editor);
+      expect(h.history.undoStack).toHaveLength(undoDepth);
+      expect(h.app.scene.getNonDeletedElement(container.id)).toMatchObject({
+        width: 250,
+        height,
+      });
+      Keyboard.undo();
+      expect(h.app.scene.getNonDeletedElement(container.id)).toBeNull();
+      Keyboard.redo();
+      expect(h.app.scene.getNonDeletedElement(container.id)).toMatchObject({
+        width: 200,
+        height: 200,
+      });
+    },
+  );
+
+  describe.each([CaptureUpdateAction.NEVER, CaptureUpdateAction.IMMEDIATELY])(
+    "confirming a host label with %s",
+    (captureUpdate) => {
+      it.each(["body", "metadata"] as const)(
+        "restores the host's %s revision when undoing subsequent local input",
+        async (field) => {
+          await render(<Excalidraw handleKeyboardGlobally />);
+          const { container, editor } = await openEmptyLabel();
+          const draftText = "Local draft";
+          const hostText = field === "body" ? "Host revision" : draftText;
+          const localText = "Local edit after host revision";
+          const customData = { revision: 42 };
+          updateTextEditor(editor, draftText);
+          const labelId = h.state.editingTextElement!.id;
+          const undoDepth = h.history.undoStack.length;
+          const revise = (mode: CaptureUpdateActionType) =>
+            act(() =>
+              h.app.updateScene({
+                elements: h.app.scene
+                  .getElementsIncludingDeleted()
+                  .map((el) =>
+                    el.id === labelId && el.type === "text"
+                      ? newElementWith(
+                          el,
+                          field === "body"
+                            ? { originalText: hostText, text: hostText }
+                            : { customData },
+                          true,
+                        )
+                      : el,
+                  ),
+                captureUpdate: mode,
+              }),
+            );
+          if (field === "body") {
+            revise(CaptureUpdateAction.EVENTUALLY);
+            expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject({
+              originalText: hostText,
+            });
+          }
+          revise(captureUpdate);
+          const expectedRevision = {
+            originalText: hostText,
+            containerId: container.id,
+            ...(field === "metadata" ? { customData } : {}),
+          };
+          expect(h.store.snapshot.elements.get(labelId)).toMatchObject(
+            expectedRevision,
+          );
+          expect(
+            h.store.snapshot.elements.get(container.id)?.boundElements,
+          ).toContainEqual({ type: "text", id: labelId });
+          const expectBinding = () =>
+            expect(
+              h.app.scene.getNonDeletedElement(container.id)?.boundElements,
+            ).toContainEqual({ type: "text", id: labelId });
+          updateTextEditor(editor, localText);
+          Keyboard.exitTextEditor(editor);
+          Keyboard.undo();
+          expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject(
+            expectedRevision,
+          );
+          expectBinding();
+          Keyboard.redo();
+          expect(h.app.scene.getNonDeletedElement(labelId)).toMatchObject({
+            ...expectedRevision,
+            originalText: localText,
+          });
+          expectBinding();
+
+          expect(h.store.snapshot.elements.get(labelId)).toMatchObject({
+            ...expectedRevision,
+            originalText: localText,
+          });
+          expect(h.history.undoStack).toHaveLength(
+            undoDepth +
+              1 +
+              Number(captureUpdate === CaptureUpdateAction.IMMEDIATELY),
+          );
+        },
+      );
+
+      it("keeps a version-only echo of an unsubmitted label out of history", async () => {
+        await render(<Excalidraw handleKeyboardGlobally />);
+        const independent = UI.createElement("rectangle", {
+          x: 450,
+          y: 200,
+          width: 50,
+          height: 50,
+        });
+        const { container, editor } = await openEmptyLabel();
+        const labelId = h.state.editingTextElement!.id;
+        updateTextEditor(editor, "Local draft");
+        act(() =>
+          h.app.updateScene({
+            elements: h.app.scene.getElementsIncludingDeleted().map((el) => {
+              if (el.id === independent.id) {
+                return newElementWith(el, { x: 470 });
+              }
+              return el.id === labelId ? newElementWith(el, {}, true) : el;
+            }),
+            captureUpdate,
+          }),
+        );
+        expect(h.store.snapshot.elements.get(independent.id)?.x).toBe(470);
+        expect(h.store.snapshot.elements.get(labelId)).toBeUndefined();
+        expect(
+          h.store.snapshot.elements.get(container.id)?.boundElements ?? [],
+        ).toEqual([]);
+        Keyboard.exitTextEditor(editor);
+        Keyboard.undo();
+        expect(h.app.scene.getNonDeletedElement(labelId)).toBeNull();
+        expect(h.app.scene.getNonDeletedElement(independent.id)?.x).toBe(470);
+      });
+    },
+  );
+
   it("captures each explicit update across the start of a draft in one batch", async () => {
     const onIncrement = vi.fn<(increment: StoreIncrement) => void>();
     await render(

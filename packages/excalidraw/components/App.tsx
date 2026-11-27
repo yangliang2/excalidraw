@@ -232,6 +232,7 @@ import type {
   FileId,
   NonDeletedExcalidrawElement,
   ExcalidrawTextContainer,
+  ExcalidrawTextElement,
   ExcalidrawFrameLikeElement,
   ExcalidrawMagicFrameElement,
   ExcalidrawIframeLikeElement,
@@ -3264,23 +3265,30 @@ class App extends React.Component<AppProps, AppState> {
         const visibleLabel = labelId
           ? previous.elements.get(labelId)
           : undefined;
-        // originalText is the authored body. Wrapped text can change as a
-        // side effect of layout while the host is echoing the draft.
         if (
-          (action === CaptureUpdateAction.NEVER ||
-            action === CaptureUpdateAction.IMMEDIATELY) &&
           label &&
           isTextElement(label) &&
           !label.isDeleted &&
           label.originalText.trim() &&
           visibleLabel &&
-          isTextElement(visibleLabel) &&
-          label.originalText !== visibleLabel.originalText
+          isTextElement(visibleLabel)
         ) {
-          capturesLabelRevision = true;
-          if (!draft.elements.has(label.id)) {
-            draft.elements.set(label.id, label);
+          // Position, size and wrapped text are derived by the bound editor.
+          // A version-only echo of editor input does not publish that input.
+          const authoredFieldsChangedFrom = (previous: ExcalidrawTextElement) =>
+            hasElementContentChange(previous, {
+              ...label,
+              x: previous.x,
+              y: previous.y,
+              width: previous.width,
+              height: previous.height,
+              text: previous.text,
+            });
+          if (authoredFieldsChangedFrom(visibleLabel)) {
+            draft.hostLabel = label;
           }
+          capturesLabelRevision =
+            !!draft.hostLabel && !authoredFieldsChangedFrom(draft.hostLabel);
         }
         const relatedIds = new Set<string>();
         for (const binding of normalized?.get(draft.containerId)
@@ -3354,6 +3362,12 @@ class App extends React.Component<AppProps, AppState> {
               ? bindings
               : hostElement.boundElements && [],
           });
+          if (
+            id === draft.containerId &&
+            projected.height !== hostElement.height
+          ) {
+            draft.hostHeight = projected.height;
+          }
           draft.elements.set(id, projected);
           elementPatches.set(id, {
             element: projected,
@@ -3402,7 +3416,10 @@ class App extends React.Component<AppProps, AppState> {
             elements[id] = element;
             continue;
           }
-          if (id === draftLabelId) {
+          if (
+            id === draftLabelId ||
+            (id === labelId && !element.isDeleted && !capturesLabelRevision)
+          ) {
             continue;
           }
           const before = committed.elements.get(id);

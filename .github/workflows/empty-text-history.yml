@@ -1,0 +1,58 @@
+name: Empty text history acceptance
+on: pull_request
+
+permissions:
+  contents: read
+
+concurrency:
+  group: empty-text-history-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  empty-text-history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Verify checkout ${{ github.sha }} for PR ${{ github.event.pull_request.number }} at ${{ github.event.pull_request.head.sha }} into ${{ github.event.pull_request.base.sha }}
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: yarn
+      - name: Verify browser check exit protocol
+        id: protocol
+        run: |
+          code=0
+          python3 scripts/browser/test_empty_text_preview_ownership.py || code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - run: yarn install --frozen-lockfile
+      - run: yarn playwright install --with-deps chromium
+      - name: Verify production empty text history
+        id: production
+        run: |
+          code=0
+          python3 scripts/browser/check-empty-text-production.py || code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - name: Classify browser check protocol failure
+        if: failure() && steps.protocol.outputs.exit_code == '1'
+        run: echo "Browser check exit protocol tests failed"
+      - name: Classify browser check protocol environment failure
+        if: failure() && steps.protocol.outputs.exit_code == '2'
+        run: echo "Browser check exit protocol tests reported an environment failure"
+      - name: Classify production browser product failure
+        if: failure() && steps.production.outputs.exit_code == '1'
+        run: echo "Production browser check failed its build or behavior assertions"
+      - name: Classify production browser environment failure
+        if: failure() && steps.production.outputs.exit_code == '2'
+        run: echo "Production browser check reported an environment failure"
+      - name: Retain production browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: empty-text-history-production-attempt-${{ github.run_attempt }}
+          path: test-results/empty-text-history/
+          retention-days: 14
+          if-no-files-found: error

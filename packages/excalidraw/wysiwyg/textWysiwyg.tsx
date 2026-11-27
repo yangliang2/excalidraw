@@ -245,7 +245,10 @@ const getLineCaretXFromNativeLayout = ({
   return measured ? measured.positions[0] - measured.left : null;
 };
 
-type SubmitHandler = () => void;
+type TextEditor = {
+  submit: () => void;
+  discard: () => void;
+};
 
 export const textWysiwyg = ({
   onChange,
@@ -276,7 +279,7 @@ export const textWysiwyg = ({
   initialCaretSceneCoords?: { x: number; y: number } | null;
   /** range of `originalText` to select (takes precedence over the caret) */
   initialSelection?: { start: number; end: number } | null;
-}): SubmitHandler => {
+}): TextEditor => {
   const ownerDocument = excalidrawContainer?.ownerDocument ?? document;
   const ownerWindow = ownerDocument.defaultView ?? window;
   // the editor's box: the part of the canvas a caret is revealed into (see
@@ -411,6 +414,11 @@ export const textWysiwyg = ({
             }
           }
 
+          // A resize supplied during editing sets a floor for auto-shrink.
+          const draft = app.text.newShapeLabelDraft;
+          const hostHeight =
+            draft?.containerId === container.id ? draft.hostHeight : undefined;
+
           // autogrow container height if text exceeds
           if (!isArrowElement(container) && height > maxHeight) {
             const targetContainerHeight = computeContainerDimensionForBoundText(
@@ -429,12 +437,13 @@ export const textWysiwyg = ({
             // autoshrink container height until original container height
             // is reached when text is removed
             !isArrowElement(container) &&
-            container.height > originalContainerData.height &&
+            container.height >
+              Math.max(originalContainerData.height, hostHeight ?? 0) &&
             height < maxHeight
           ) {
-            const targetContainerHeight = computeContainerDimensionForBoundText(
-              height,
-              container.type,
+            const targetContainerHeight = Math.max(
+              computeContainerDimensionForBoundText(height, container.type),
+              hostHeight ?? 0,
             );
             app.scene.mutateElement(container, {
               height: targetContainerHeight,
@@ -1027,21 +1036,24 @@ export const textWysiwyg = ({
   // using a state variable instead of passing it to the handleSubmit callback
   // so that we don't need to create separate a callback for event handlers
   let submittedViaKeyboard = false;
+  const discard = () => {
+    if (!isDestroyed) {
+      isDestroyed = true;
+      cleanup();
+    }
+  };
   const handleSubmit = () => {
     // prevent double submit
     if (isDestroyed) {
       return;
     }
 
-    isDestroyed = true;
     // cleanup must be run before onSubmit otherwise when app blurs the wysiwyg
     // it'd get stuck in an infinite loop of blur→onSubmit after we re-focus the
     // wysiwyg on update
-    cleanup();
-    const updateElement = app.scene.getElement(
-      element.id,
-    ) as ExcalidrawTextElement;
-    if (!updateElement) {
+    discard();
+    const updateElement = app.scene.getNonDeletedElement(element.id);
+    if (!updateElement || !isTextElement(updateElement)) {
       return;
     }
     const container = getContainerElement(
@@ -1140,7 +1152,12 @@ export const textWysiwyg = ({
     ownerWindow.setTimeout(() => {
       // If we interacted within shape actions menu or its popovers/triggers,
       // keep submit disabled and don't steal focus back to textarea.
-      if (inShapeActionsMenu || isPropertiesTrigger || isPropertiesContent) {
+      if (
+        isDestroyed ||
+        inShapeActionsMenu ||
+        isPropertiesTrigger ||
+        isPropertiesContent
+      ) {
         return;
       }
 
@@ -1322,12 +1339,14 @@ export const textWysiwyg = ({
   // rAF (+ capture to by doubly sure) so we don't catch te pointerdown that
   // triggered the wysiwyg
   ownerWindow.requestAnimationFrame(() => {
-    ownerWindow.addEventListener("pointerdown", onPointerDown, {
-      capture: true,
-    });
+    if (!isDestroyed) {
+      ownerWindow.addEventListener("pointerdown", onPointerDown, {
+        capture: true,
+      });
+    }
   });
   ownerWindow.addEventListener("beforeunload", handleSubmit);
   editorBox!.appendChild(editable);
 
-  return handleSubmit;
+  return { submit: handleSubmit, discard };
 };

@@ -1,7 +1,6 @@
 name: "Bundle Size check @excalidraw/excalidraw"
 on:
   pull_request:
-    branches: [master]
 
 permissions:
   contents: read

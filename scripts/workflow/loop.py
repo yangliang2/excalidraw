@@ -67,6 +67,8 @@ def load_plan(path):
             raise ValueError('every step must reference known acceptance IDs')
         if not set(s.get('deps', [])) <= set(ids):
             raise ValueError('unknown dependency')
+        if not isinstance(s.get('invalidate_on_change', False), bool):
+            raise ValueError('invalidate_on_change must be boolean')
         if s['kind'] != 'human':
             validate_command(s)
     byid = {s['id']: s for s in steps}
@@ -121,9 +123,9 @@ def snapshot(p):
     return value
 
 
-def invalidate(p, state):
+def invalidate(p, state, replay_work=True):
     for s in p['steps']:
-        if s['kind'] != 'work':
+        if s['kind'] != 'work' or (replay_work and s.get('invalidate_on_change', False)):
             state['steps'][s['id']] = {'status': 'pending'}
 
 
@@ -182,7 +184,7 @@ def finish(p, state, folder):
     state['running'] = None
     if kind == 'repair':
         if outcome == 'passed':
-            invalidate(p, state)  # same-SHA repairs also require a fresh verification attempt
+            invalidate(p, state, replay_work=False)  # recheck same-SHA repairs without replaying successful work
             for value in state['steps'].values():
                 if value['status'] == 'failed':
                     value.clear()
@@ -344,7 +346,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == '_worker':
         worker(Path(sys.argv[2]), int(sys.argv[3])); return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['init', 'gate', 'run', 'refresh', 'decide', 'reconcile'])
+    parser.add_argument('command', choices=['init', 'gate', 'run', 'refresh', 'retry', 'decide', 'reconcile'])
     parser.add_argument('--plan', type=Path, required=True)
     parser.add_argument('--state', type=Path, required=True)
     parser.add_argument('--step')
@@ -381,6 +383,28 @@ def main():
                 if args.command == 'run':
                     result = run(p, state, folder, lock.fileno())
                 elif args.command == 'gate':
+                    result = inspect(p, state, folder)
+                elif args.command == 'retry':
+                    if state.get('running') or state.get('halt'):
+                        raise ValueError('unresolved execution or halt; reconcile before check retry')
+                    if snapshot(p) != state['candidate']:
+                        raise ValueError('candidate/base/spec changed; refresh required')
+                    problem = verify_evidence(state, folder)
+                    if problem:
+                        raise ValueError(problem)
+                    step = next((s for s in p['steps'] if s['id'] == args.step), None)
+                    if (not step or step['kind'] not in ('check', 'review')
+                            or state['steps'][args.step]['status'] != 'environment-error'):
+                        raise ValueError('retry requires an environment-error check or review')
+                    prior = state['steps'][args.step]
+                    receipt_path = folder / prior['receipt']
+                    if (not receipt_path.is_file() or sha(receipt_path.read_bytes()) != prior['receipt_sha256']
+                            or not receipt_valid(read(receipt_path), folder)):
+                        raise ValueError('environment-error evidence changed; reconcile before retry')
+                    state['history'].append({'event': 'retry-check', 'step': args.step,
+                                             'prior': state['steps'][args.step]})
+                    state['steps'][args.step] = {'status': 'pending'}
+                    save(path, state)
                     result = inspect(p, state, folder)
                 elif args.command == 'refresh':
                     if state['running']:

@@ -15,7 +15,9 @@ import {
 import { pointFrom, type Radians } from "@excalidraw/math";
 
 import {
+  CaptureUpdateAction,
   DEFAULT_BOUND_TEXT_LABEL_POSITION,
+  deepCopyElement,
   fixBindingsAfterDeletion,
   getActiveTextElement,
   getApproxMinLineHeight,
@@ -40,10 +42,11 @@ import {
   newElementWith,
   newTextElement,
   refreshTextDimensions,
+  StoreChange,
   updateBoundElements,
 } from "@excalidraw/element";
 
-import type { ArrowEndpoint } from "@excalidraw/element";
+import type { ArrowEndpoint, StoreSnapshot } from "@excalidraw/element";
 import type {
   ExcalidrawElement,
   ExcalidrawTextContainer,
@@ -66,6 +69,16 @@ type AppTextDependencies = {
   getStylesPanelMode: () => StylesPanelMode;
 };
 
+type ShapeLabelDraft = {
+  labelId?: string;
+  containerId: string;
+  // The most recent authored host revision, including uncaptured updates.
+  hostLabel?: ExcalidrawTextElement;
+  hostHeight?: number;
+  // Values before the editor's layout writes, updated only by host scene writes.
+  elements: Map<string, ExcalidrawElement>;
+};
+
 /**
  * Texts, but for the text tool's pointer interaction (`AppTextTool`):
  *
@@ -83,7 +96,72 @@ type AppTextDependencies = {
 export class AppText {
   constructor(private app: App, private dependencies: AppTextDependencies) {}
 
-  public textWysiwygSubmitHandler: ReturnType<typeof textWysiwyg> | null = null;
+  private textEditor: ReturnType<typeof textWysiwyg> | null = null;
+  private shapeLabelDraft: ShapeLabelDraft | null = null;
+
+  public get newShapeLabelDraft() {
+    return this.shapeLabelDraft;
+  }
+
+  public get textWysiwygSubmitHandler() {
+    return this.textEditor?.submit ?? null;
+  }
+
+  public isEditingNewShapeLabel(elementId: string) {
+    return this.shapeLabelDraft?.labelId === elementId;
+  }
+
+  public discardNewShapeLabel() {
+    if (this.shapeLabelDraft) {
+      const editor = this.textEditor;
+      this.textEditor = null;
+      this.shapeLabelDraft = null;
+      editor?.discard();
+    }
+  }
+
+  public discardInvalidShapeLabel() {
+    const draft = this.shapeLabelDraft;
+    if (!draft?.labelId) {
+      return false;
+    }
+    const label = this.app.scene.getNonDeletedElement(draft.labelId);
+    if (
+      label &&
+      isTextElement(label) &&
+      label.containerId === draft.containerId &&
+      this.app.scene.getNonDeletedElement(draft.containerId)
+    ) {
+      return false;
+    }
+    this.discardNewShapeLabel();
+    return true;
+  }
+
+  public getIncomingShapeLabelDisposition(
+    elements: readonly ExcalidrawElement[],
+  ) {
+    const draft = this.shapeLabelDraft;
+    if (!draft?.labelId) {
+      return null;
+    }
+    const label = elements.find(({ id }) => id === draft.labelId);
+    if (!label || label.isDeleted || !isTextElement(label)) {
+      return null;
+    }
+    const container = label.containerId
+      ? elements.find(({ id }) => id === label.containerId)
+      : null;
+    const hasLiveContainer = container && !container.isDeleted;
+    if (label.containerId === draft.containerId && hasLiveContainer) {
+      return null;
+    }
+    if (!label.originalText.trim()) {
+      return "discard";
+    }
+    return label.containerId && !hasLiveContainer ? "detach" : "preserve";
+  }
+
   private getTextCreationGridPoint = (x: number, y: number) => {
     const effectiveGridSize = this.app.getEffectiveGridSize();
 
@@ -182,11 +260,9 @@ export class AppText {
       initialSelection?: { start: number; end: number } | null;
     },
   ) {
-    const elementsMap = this.app.scene.getElementsMapIncludingDeleted();
-
     const updateElement = (nextOriginalText: string, isDeleted: boolean) => {
-      const latestTextElement =
-        this.app.scene.getElement<ExcalidrawTextElement>(element.id);
+      const elementsMap = this.app.scene.getElementsMapIncludingDeleted();
+      const latestTextElement = this.app.scene.getNonDeletedElement(element.id);
 
       if (!latestTextElement || !isTextElement(latestTextElement)) {
         return;
@@ -278,7 +354,7 @@ export class AppText {
       }
     };
 
-    this.textWysiwygSubmitHandler = textWysiwyg({
+    this.textEditor = textWysiwyg({
       canvas: this.app.canvas,
       getViewportCoords: (x, y) => {
         const { x: viewportX, y: viewportY } = sceneCoordsToViewportCoords(
@@ -302,7 +378,7 @@ export class AppText {
         }
       }),
       onSubmit: withBatchedUpdates(({ viaKeyboard, nextOriginalText }) => {
-        this.textWysiwygSubmitHandler = null;
+        this.textEditor = null;
 
         const isDeleted = !nextOriginalText.trim();
         updateElement(nextOriginalText, isDeleted);
@@ -318,39 +394,68 @@ export class AppText {
             ? element.containerId || (!isDeleted ? element.id : null)
             : null;
 
-        if (elementIdToSelect) {
-          // needed to ensure state is updated before "finalize" action
-          // that's invoked on keyboard-submit as well
-          // TODO either move this into finalize as well, or handle all state
-          // updates in one place, skipping finalize action
-          flushSync(() => {
-            this.app.setState((prevState) => ({
-              selectedElementIds: makeNextSelectedElementIds(
-                {
-                  ...prevState.selectedElementIds,
-                  [elementIdToSelect]: true,
-                },
-                prevState,
-              ),
-            }));
-          });
-        }
-
         if (isDeleted) {
           fixBindingsAfterDeletion(this.app.scene.getNonDeletedElements(), [
             element,
           ]);
         }
 
-        if (!isDeleted || isExistingElement) {
+        // An empty label can still leave its shape resized by the editor.
+        const draft = this.shapeLabelDraft;
+        this.shapeLabelDraft = null;
+        if (draft) {
+          const container = this.app.scene.getNonDeletedElement(
+            draft.containerId,
+          );
+          const resizedFrom = (previous: ExcalidrawElement | undefined) =>
+            container &&
+            previous &&
+            !previous.isDeleted &&
+            (container.width !== previous.width ||
+              container.height !== previous.height);
+          const editorResized = resizedFrom(
+            draft.elements.get(draft.containerId),
+          );
+          const didResize = (snapshot: StoreSnapshot) =>
+            editorResized &&
+            resizedFrom(snapshot.elements.get(draft.containerId));
+          if (isDeleted && container && editorResized) {
+            updateBoundElements(container, this.app.scene, {
+              renderEnvironment: this.app.renderEnvironment,
+            });
+          }
+          this.app.store.scheduleCapture((snapshot) => {
+            const committedLabel = snapshot.elements.get(element.id);
+            if (
+              isDeleted &&
+              (!committedLabel || committedLabel.isDeleted) &&
+              !didResize(snapshot)
+            ) {
+              return false;
+            }
+            this.app.prepareShapeLabelCapture(draft, snapshot);
+            return true;
+          });
+        } else if (!isDeleted || isExistingElement) {
           this.app.store.scheduleCapture();
         }
 
+        // Apply keyboard selection before the finalize action, as part of
+        // the same commit as the label and its binding cleanup.
         flushSync(() => {
-          this.app.setState({
+          this.app.setState((prevState) => ({
             newElement: null,
             editingTextElement: null,
-          });
+            selectedElementIds: elementIdToSelect
+              ? makeNextSelectedElementIds(
+                  {
+                    ...prevState.selectedElementIds,
+                    [elementIdToSelect]: true,
+                  },
+                  prevState,
+                )
+              : prevState.selectedElementIds,
+          }));
         });
 
         // tools that survive the submit (locked, or autoshape's
@@ -377,6 +482,25 @@ export class AppText {
     });
     // deselect all other elements when inserting text
     this.app.selection.clear();
+    if (this.isEditingNewShapeLabel(element.id)) {
+      // Opening the editor clears its selection as part of the draft. This
+      // must not produce a selection-only undo entry at a later canvas action.
+      this.app.store.scheduleMicroAction({
+        action: CaptureUpdateAction.NEVER,
+        resolveChange: (snapshot) => {
+          const next = snapshot.applyChange({
+            elements: {},
+            appState: {
+              selectedElementIds: {},
+              selectedGroupIds: {},
+              editingGroupId: null,
+            },
+          });
+          const change = StoreChange.create(snapshot, next);
+          return Object.keys(change.appState).length ? change : null;
+        },
+      });
+    }
     // (the linear element editor stays up, to come back to on submit — but
     // without the hover affordances, which are for the selection)
     if (this.app.state.selectedLinearElement) {
@@ -718,6 +842,25 @@ export class AppText {
       !isArrowElement(container) &&
       !isStickyNoteElement(container)
     ) {
+      const elements = new Map<string, ExcalidrawElement>([
+        [container.id, deepCopyElement(container)],
+      ]);
+      for (const binding of container.boundElements ?? []) {
+        const bound = this.app.scene.getNonDeletedElement(binding.id);
+        if (bound) {
+          elements.set(bound.id, deepCopyElement(bound));
+          if (isArrowElement(bound)) {
+            const label = getBoundTextElement(
+              bound,
+              this.app.scene.getNonDeletedElementsMap(),
+            );
+            if (label) {
+              elements.set(label.id, deepCopyElement(label));
+            }
+          }
+        }
+      }
+      this.shapeLabelDraft = { containerId: container.id, elements };
       const fontString = {
         fontSize,
         fontFamily,
@@ -834,6 +977,9 @@ export class AppText {
       });
 
     if (!existingTextElement && shouldBindToContainer && container) {
+      if (this.shapeLabelDraft?.containerId === container.id) {
+        this.shapeLabelDraft.labelId = element.id;
+      }
       this.app.scene.mutateElement(container, {
         boundElements: (container.boundElements || []).concat({
           type: "text",

@@ -27,7 +27,7 @@ plan = {'schema': 1, 'repo': str(repo), 'base_ref': '41f33a9581330d7eee664ad0832
         'acceptance': ac, 'max_repairs': 0, 'steps': [
         {'id': 'production-browser', 'kind': 'check', 'deps': [], 'ac': ac[:2], 'argv': command('scripts/browser/check-rtl-production.py'), 'timeout': 1200},
         {'id': 'size-gate-smoke', 'kind': 'check', 'deps': [], 'ac': ['AC-CI'], 'argv': ['node', '--test', 'scripts/check-package-size-smoke.mjs'], 'timeout': 60},
-        {'id': 'publish', 'kind': 'work', 'deps': ['production-browser', 'size-gate-smoke'], 'ac': ['AC-HANDOFF'], 'argv': command('scripts/workflow/publish_rtl.py'), 'timeout': 120},
+        {'id': 'publish', 'kind': 'work', 'invalidate_on_change': True, 'deps': ['production-browser', 'size-gate-smoke'], 'ac': ['AC-HANDOFF'], 'argv': command('scripts/workflow/publish_rtl.py'), 'timeout': 120},
         {'id': 'github-ci', 'kind': 'check', 'deps': ['publish'], 'ac': ['AC-CI', 'AC-HANDOFF'], 'argv': command('scripts/workflow/github_gate.py') + ['--repo', 'yangliang2/excalidraw', '--pr', '14'] + sum([['--required', name] for name in ['browser', 'size', 'lint', 'coverage', 'semantic', 'label-scope']], []), 'timeout': 120},
         {'id': 'review', 'kind': 'review', 'deps': ['github-ci'], 'ac': ac, 'argv': command('scripts/workflow/claude_review.py'), 'timeout': 660},
         {'id': 'product', 'kind': 'human', 'deps': ['review'], 'ac': ac}]}

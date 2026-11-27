@@ -117,6 +117,7 @@ import {
   newImageElement,
   newLinearElement,
   deepCopyElement,
+  Delta,
   duplicateElements,
   hasBoundTextElement,
   isArrowElement,
@@ -183,6 +184,7 @@ import {
   getSelectedGroupIdForElement,
   getSelectedGroupIds,
   syncInvalidIndices,
+  syncInvalidIndicesImmutable,
   excludeElementsInFramesFromSelection,
   makeNextSelectedElementIds,
   getCursorForResizingElement,
@@ -190,7 +192,10 @@ import {
   getDragOffsetXY,
   Scene,
   Store,
+  StoreChange,
+  StoreSnapshot,
   CaptureUpdateAction,
+  type CaptureUpdateActionType,
   type ElementUpdate,
   hitElementBoundingBox,
   isLineElement,
@@ -227,6 +232,7 @@ import type {
   FileId,
   NonDeletedExcalidrawElement,
   ExcalidrawTextContainer,
+  ExcalidrawTextElement,
   ExcalidrawFrameLikeElement,
   ExcalidrawMagicFrameElement,
   ExcalidrawIframeLikeElement,
@@ -234,6 +240,7 @@ import type {
   ExcalidrawIframeElement,
   ExcalidrawEmbeddableElement,
   Ordered,
+  OrderedExcalidrawElement,
   MagicGenerationData,
   ExcalidrawArrowElement,
   ExcalidrawElbowArrowElement,
@@ -447,6 +454,7 @@ import type {
   BinaryFileData,
   ExcalidrawImperativeAPI,
   BinaryFiles,
+  ObservedAppState,
   Gesture,
   GestureEvent,
   LibraryItems,
@@ -470,6 +478,54 @@ import type {
 } from "../types";
 import type { RoughCanvas } from "roughjs/bin/canvas";
 import type { Action, ActionResult } from "../actions/types";
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null &&
+  typeof value === "object" &&
+  (Object.getPrototypeOf(value) === Object.prototype ||
+    Object.getPrototypeOf(value) === null);
+
+// Match the Store's copy semantics for plain objects and arrays, and keep
+// identity comparison for other in-memory metadata values.
+const hasElementFieldChange = (previous: unknown, next: unknown): boolean => {
+  if (Object.is(previous, next)) {
+    return false;
+  }
+  if (Array.isArray(previous) && Array.isArray(next)) {
+    return (
+      previous.length !== next.length ||
+      Object.keys(previous).length !== Object.keys(next).length ||
+      previous.some((value, index) => hasElementFieldChange(value, next[index]))
+    );
+  }
+  if (isPlainRecord(previous) && isPlainRecord(next)) {
+    const keys = Object.keys(previous);
+    return (
+      keys.length !== Object.keys(next).length ||
+      keys.some(
+        (key) =>
+          !Object.prototype.hasOwnProperty.call(next, key) ||
+          hasElementFieldChange(previous[key], next[key]),
+      )
+    );
+  }
+  return true;
+};
+
+const isElementVersionField = (key: string) =>
+  key === "version" || key === "versionNonce" || key === "updated";
+
+const hasElementContentChange = (
+  previous: ExcalidrawElement,
+  next: ExcalidrawElement,
+) =>
+  Delta.getDifferences(previous, next, true).some((key) => {
+    const prop = key as keyof ExcalidrawElement;
+    return (
+      !isElementVersionField(key) &&
+      hasElementFieldChange(previous[prop], next[prop])
+    );
+  });
 
 const isUIConfig = (ui: AppProps["ui"]): ui is UIConfig =>
   typeof ui === "object" && ui !== null;
@@ -781,6 +837,9 @@ class App extends React.Component<AppProps, AppState> {
   /** offsets of `elementRenderOverrides`; keeps its identity while they don't change */
   private elementRenderOffsets: ElementRenderOffsets = new Map();
   private renderOverridesUpdatePending = false;
+  private pendingDraftAppState: Partial<
+    Pick<AppState, keyof ObservedAppState>
+  > | null = null;
 
   private getRenderOverrideConfig = () => ({
     elementRenderOverrides: this.elementRenderOverrides,
@@ -897,7 +956,7 @@ class App extends React.Component<AppProps, AppState> {
     this.library = new Library(this);
     this.actionManager = new ActionManager(
       this.syncActionResult,
-      () => this.state,
+      this.getActionAppState,
       () => this.scene.getElementsIncludingDeleted(),
       this,
     );
@@ -3145,16 +3204,517 @@ class App extends React.Component<AppProps, AppState> {
     });
   };
 
+  // Action results can spread their input state, including values written
+  // earlier in the React batch. History baselines are owned by Store.
+  private getActionAppState = (): AppState =>
+    this.pendingDraftAppState
+      ? { ...this.state, ...this.pendingDraftAppState }
+      : this.state;
+
+  private trackDraftAppState(appState: Partial<AppState>) {
+    const current = this.getActionAppState();
+    const state = { ...current, ...appState };
+    const observed = getObservedAppState(state);
+    const updates: Partial<ObservedAppState> = {};
+    for (const key of Object.keys(observed) as (keyof ObservedAppState)[]) {
+      if (Object.prototype.hasOwnProperty.call(appState, key)) {
+        Object.assign((this.pendingDraftAppState ??= {}), {
+          [key]: state[key],
+        });
+        const value = observed[key];
+        Object.assign(updates, {
+          [key]: value && typeof value === "object" ? { ...value } : value,
+        });
+      }
+    }
+    return { current, updates };
+  }
+
+  private scheduleDraftSceneUpdate(
+    appState: Partial<AppState>,
+    action?: CaptureUpdateActionType,
+    elements?: SceneData["elements"],
+    hostOwnsLabel = false,
+  ) {
+    const draft = this.text.newShapeLabelDraft;
+    const labelId = hostOwnsLabel ? undefined : draft?.labelId;
+    const { current, updates } = this.trackDraftAppState(appState);
+    let change: StoreChange = { elements: {}, appState: {} };
+    let capturesLabelRevision = false;
+    const elementPatches = new Map<
+      string,
+      { element: OrderedExcalidrawElement; versionIncrement: number }
+    >();
+    if (elements && (draft || action)) {
+      // Compute the element change against the live scene at the time of the
+      // call. The scene can still contain the unsaved label and resize.
+      const previous = StoreSnapshot.create(
+        this.scene.getElementsMapIncludingDeleted(),
+        current,
+      );
+      const normalized = syncInvalidIndicesImmutable(elements);
+      const next = previous.maybeClone(
+        action ?? CaptureUpdateAction.EVENTUALLY,
+        normalized,
+        undefined,
+      );
+      change = StoreChange.create(previous, next);
+
+      if (draft) {
+        const label = labelId ? change.elements[labelId] : undefined;
+        const visibleLabel = labelId
+          ? previous.elements.get(labelId)
+          : undefined;
+        if (
+          label &&
+          isTextElement(label) &&
+          !label.isDeleted &&
+          label.originalText.trim() &&
+          visibleLabel &&
+          isTextElement(visibleLabel)
+        ) {
+          // Position, size and wrapped text are derived by the bound editor.
+          // A version-only echo of editor input does not publish that input.
+          const authoredFieldsChangedFrom = (previous: ExcalidrawTextElement) =>
+            hasElementContentChange(previous, {
+              ...label,
+              x: previous.x,
+              y: previous.y,
+              width: previous.width,
+              height: previous.height,
+              text: previous.text,
+            });
+          if (authoredFieldsChangedFrom(visibleLabel)) {
+            draft.hostLabel = label;
+          }
+          capturesLabelRevision =
+            !!draft.hostLabel && !authoredFieldsChangedFrom(draft.hostLabel);
+        }
+        const relatedIds = new Set<string>();
+        for (const binding of normalized?.get(draft.containerId)
+          ?.boundElements ?? []) {
+          if (binding.id === draft.labelId) {
+            continue;
+          }
+          relatedIds.add(binding.id);
+          if (binding.type === "arrow") {
+            const arrow = normalized?.get(binding.id);
+            for (const arrowBinding of arrow?.boundElements ?? []) {
+              relatedIds.add(arrowBinding.id);
+            }
+          }
+        }
+        for (const id of relatedIds) {
+          const element = previous.elements.get(id) ?? change.elements[id];
+          if (element && !draft.elements.has(id)) {
+            draft.elements.set(id, deepCopyElement(element));
+          }
+        }
+
+        for (const [id, element] of Object.entries(change.elements)) {
+          const visible = previous.elements.get(id);
+          const hostElement = draft.elements.get(id);
+          if (
+            !hostElement ||
+            !visible ||
+            (hostOwnsLabel && id === draft.labelId)
+          ) {
+            continue;
+          }
+
+          // A complete host element may echo current layout from the editor.
+          // Keep the host's previous value for each echoed layout field.
+          const projected = { ...element };
+          const incoming = normalized?.get(id) ?? element;
+          for (const key of Delta.getDifferences<ExcalidrawElement>(
+            hostElement,
+            visible,
+            true,
+          )) {
+            if (isElementVersionField(key) || key === "boundElements") {
+              continue;
+            }
+            const prop = key as keyof OrderedExcalidrawElement;
+            if (
+              hasElementFieldChange(hostElement[prop], visible[prop]) &&
+              !hasElementFieldChange(visible[prop], incoming[prop])
+            ) {
+              Object.assign(projected, { [prop]: hostElement[prop] });
+            }
+          }
+
+          const keepBinding = ({ id }: { id: string }) => id !== labelId;
+          const removed = {
+            boundElements: visible.boundElements?.filter(keepBinding),
+          };
+          const added = {
+            boundElements: element.boundElements?.filter(keepBinding),
+          };
+          Delta.diffArrays(removed, added, "boundElements", ({ id }) => id);
+          const bindings = Delta.mergeArrays(
+            hostElement.boundElements,
+            added.boundElements,
+            removed.boundElements,
+            ({ id }) => id,
+          );
+          Object.assign(projected, {
+            boundElements: bindings.length
+              ? bindings
+              : hostElement.boundElements && [],
+          });
+          if (
+            id === draft.containerId &&
+            projected.height !== hostElement.height
+          ) {
+            draft.hostHeight = projected.height;
+          }
+          draft.elements.set(id, projected);
+          elementPatches.set(id, {
+            element: projected,
+            versionIncrement: element.version - visible.version,
+          });
+        }
+      }
+    }
+
+    if (!action) {
+      return;
+    }
+    const previousAppState =
+      action === CaptureUpdateAction.EVENTUALLY
+        ? getObservedAppState(current)
+        : undefined;
+    this.store.scheduleMicroAction({
+      action,
+      resolveChange: (committed) => {
+        const committedLabel = labelId
+          ? committed.elements.get(labelId)
+          : undefined;
+        const capturesHostLabel =
+          capturesLabelRevision ||
+          (committedLabel && !committedLabel.isDeleted);
+        const draftLabelId =
+          capturesLabelRevision || committedLabel ? undefined : labelId;
+        const projectLabelBinding = (container: OrderedExcalidrawElement) => {
+          const bindings = container.boundElements;
+          if (!labelId || !capturesHostLabel) {
+            return bindings;
+          }
+          const keepsLabel = !change.elements[labelId]?.isDeleted;
+          const hasBinding =
+            bindings?.some(({ id }) => id === labelId) ?? false;
+          if (keepsLabel === hasBinding) {
+            return bindings;
+          }
+          return keepsLabel
+            ? [...(bindings ?? []), { type: "text", id: labelId } as const]
+            : bindings?.filter(({ id }) => id !== labelId) ?? null;
+        };
+        const elements: StoreChange["elements"] = {};
+        for (const [id, element] of Object.entries(change.elements)) {
+          if (action === CaptureUpdateAction.EVENTUALLY) {
+            elements[id] = element;
+            continue;
+          }
+          if (
+            id === draftLabelId ||
+            (id === labelId && !element.isDeleted && !capturesLabelRevision)
+          ) {
+            continue;
+          }
+          const before = committed.elements.get(id);
+          const patch = elementPatches.get(id);
+          if (!before || !patch) {
+            if (before && element.version <= before.version) {
+              continue;
+            }
+            const bindings = element.boundElements;
+            const filtered = bindings?.filter(({ id }) => id !== draftLabelId);
+            elements[id] =
+              filtered && filtered.length !== bindings?.length
+                ? newElementWith(element, {
+                    boundElements: filtered.length ? filtered : null,
+                    version: Math.max(
+                      element.version,
+                      (before?.version ?? 0) + 1,
+                    ),
+                  })
+                : element;
+            continue;
+          }
+
+          const projected =
+            id === draft?.containerId
+              ? {
+                  ...patch.element,
+                  boundElements: projectLabelBinding(patch.element),
+                }
+              : patch.element;
+          if (hasElementContentChange(before, projected)) {
+            // Advance only by this call's changes so the draft still has a
+            // newer version when it is submitted.
+            const version = before.version + patch.versionIncrement;
+            const matchesIncoming =
+              version === element.version &&
+              !hasElementContentChange(projected, element);
+
+            // Different versions of the content must not share a nonce or
+            // ElementsDelta can miss the pending changes on label submission.
+            elements[id] = matchesIncoming
+              ? element
+              : newElementWith(before, {
+                  ...projected,
+                  version,
+                  versionNonce: undefined,
+                });
+          }
+        }
+        // A host revision can change only the text element. Commit its
+        // reverse binding in the same increment even when the shape was echoed.
+        if (
+          action !== CaptureUpdateAction.EVENTUALLY &&
+          capturesHostLabel &&
+          draft &&
+          !elements[draft.containerId]
+        ) {
+          const container = committed.elements.get(draft.containerId);
+          if (container && !container.isDeleted) {
+            const boundElements = projectLabelBinding(container);
+            if (boundElements !== container.boundElements) {
+              elements[container.id] = newElementWith(container, {
+                boundElements,
+              });
+            }
+          }
+        }
+
+        const previous = previousAppState
+          ? StoreSnapshot.create(committed.elements, previousAppState)
+          : committed;
+        const next = StoreSnapshot.create(
+          committed.elements,
+          getObservedAppState({ ...previous.appState, ...updates }),
+        );
+        const appState = next.getChangedAppState(previous);
+        return Object.keys(elements).length || Object.keys(appState).length
+          ? { elements, appState }
+          : null;
+      },
+    });
+  }
+
+  public prepareShapeLabelCapture(
+    draft: NonNullable<AppText["newShapeLabelDraft"]>,
+    snapshot: StoreSnapshot,
+  ) {
+    const ids = [...draft.elements.keys()];
+    if (draft.labelId) {
+      ids.push(draft.labelId);
+    }
+    for (const id of ids) {
+      const live = this.scene.getElement(id);
+      const committed = snapshot.elements.get(id);
+      if (
+        live &&
+        committed &&
+        (live.version <= committed.version ||
+          live.versionNonce === committed.versionNonce) &&
+        hasElementContentChange(committed, live)
+      ) {
+        // A projected revision can catch up with the canvas revision. Bump
+        // the actual scene element before the Store captures the final layout.
+        this.scene.mutateElement(
+          live,
+          { version: Math.max(live.version, committed.version) + 1 },
+          { informMutation: false, isDragging: false },
+        );
+      }
+    }
+  }
+
+  private projectDraftElements(
+    elements: SceneElementsMap,
+    draft: NonNullable<AppText["newShapeLabelDraft"]>,
+    {
+      committed,
+      keepLabel = false,
+    }: { committed?: StoreSnapshot; keepLabel?: boolean } = {},
+  ) {
+    const labelId = keepLabel ? undefined : draft.labelId;
+    const projected = new Map(elements) as SceneElementsMap;
+    const committedLabel = labelId
+      ? committed?.elements.get(labelId)
+      : undefined;
+    // While editing continues, retain the revision the host already captured.
+    if (labelId && projected.has(labelId)) {
+      if (committedLabel) {
+        projected.set(labelId, committedLabel);
+      } else {
+        projected.delete(labelId);
+      }
+    }
+    for (const [id, live] of projected) {
+      if (id === draft.labelId) {
+        continue;
+      }
+      const host = draft.elements.get(id);
+      const bindings = (host ?? live).boundElements;
+      const filtered = bindings?.filter((binding) => binding.id !== labelId);
+      const previous = committed?.elements.get(id);
+      const committedBinding =
+        committedLabel && !committedLabel.isDeleted
+          ? previous?.boundElements?.find((binding) => binding.id === labelId)
+          : undefined;
+      if (!host && filtered?.length === bindings?.length) {
+        continue;
+      }
+
+      // The host values include updates made during editing, without the
+      // container and arrow layout authored by the text editor.
+      const element = {
+        ...live,
+        ...host,
+        index: live.index,
+        isDeleted: live.isDeleted,
+        boundElements: committedBinding
+          ? [...(filtered ?? []), committedBinding]
+          : filtered?.length === bindings?.length
+          ? bindings
+          : filtered?.length
+          ? filtered
+          : null,
+      };
+      if (previous && !hasElementContentChange(previous, element)) {
+        projected.set(id, previous);
+      } else if (hasElementContentChange(live, element)) {
+        projected.set(
+          id,
+          newElementWith(
+            element,
+            {
+              version: committed
+                ? Math.max(element.version, (previous?.version ?? 0) + 1)
+                : live.version + 1,
+            },
+            true,
+          ),
+        );
+      }
+    }
+    return projected;
+  }
+
+  private discardInvalidShapeLabel() {
+    const draft = this.text.newShapeLabelDraft;
+    if (!draft || !this.text.discardInvalidShapeLabel()) {
+      return;
+    }
+
+    this.pendingDraftAppState = null;
+    this.setState({ editingTextElement: null, newElement: null });
+    const label = draft.labelId
+      ? this.scene.getNonDeletedElement(draft.labelId)
+      : null;
+    if (label && !isTextElement(label)) {
+      return;
+    }
+    const keepLabel = !!label?.originalText.trim();
+    if (keepLabel && label?.containerId === draft.containerId) {
+      return;
+    }
+
+    // Drop the previous container's draft layout. An explicit nonempty
+    // rebind or detach keeps the host's label and its new bindings.
+    const live = this.scene.getElementsMapIncludingDeleted();
+    const projected = this.projectDraftElements(live, draft, { keepLabel });
+    const restored = [...projected.values()]
+      .filter((element) => live.get(element.id) !== element)
+      .map((element) => deepCopyElement(element));
+    this.store.scheduleMicroAction({
+      action: CaptureUpdateAction.NEVER,
+      resolveChange: (snapshot) => {
+        const elements: StoreChange["elements"] = {};
+        for (const element of restored) {
+          const committed = snapshot.elements.get(element.id);
+          if (committed && !hasElementContentChange(committed, element)) {
+            elements[element.id] = element;
+          }
+        }
+        // Keep revision bumps from draft cleanup out of undo without
+        // absorbing any independent host edits into this update.
+        return Object.keys(elements).length ? { elements, appState: {} } : null;
+      },
+    });
+    this.scene.replaceAllElements([...projected.values()]);
+  }
+
   public syncActionResult = withBatchedUpdates((actionResult: ActionResult) => {
     if (this.unmounted || actionResult === false) {
       return;
     }
 
-    this.store.scheduleAction(actionResult.captureUpdate);
+    const draft = this.text.newShapeLabelDraft;
+    // Open File returns a file map even when no files need replacing.
+    const replacingScene =
+      !!actionResult.elements &&
+      actionResult.captureUpdate === CaptureUpdateAction.IMMEDIATELY &&
+      (actionResult.replaceFiles || !!actionResult.files);
+    const discardingShapeLabel = draft && replacingScene;
+    if (discardingShapeLabel) {
+      this.text.discardNewShapeLabel();
+    }
+
+    let actionAppState: Partial<AppState> = discardingShapeLabel
+      ? { ...actionResult.appState, newElement: null }
+      : actionResult.appState || {};
+    let editingTextElement = discardingShapeLabel
+      ? null
+      : actionAppState.editingTextElement || null;
+    if (actionResult.elements && editingTextElement) {
+      const editingTextElementId = editingTextElement.id;
+      const nextElement = actionResult.elements.find(
+        (element) => element.id === editingTextElementId,
+      );
+      editingTextElement =
+        nextElement &&
+        isNonDeletedElement(nextElement) &&
+        isTextElement(nextElement)
+          ? nextElement
+          : null;
+    }
+
+    if ((draft || this.pendingDraftAppState) && actionResult.appState) {
+      const state = this.getActionAppState();
+      const current = getObservedAppState(state);
+      const next = getObservedAppState({
+        ...state,
+        ...actionAppState,
+        name: actionAppState.name ?? state.name,
+      });
+      const changedKeys = new Set(Delta.getRightDifferences(current, next));
+      actionAppState = { ...actionAppState };
+      for (const key of Object.keys(current) as (keyof ObservedAppState)[]) {
+        if (!changedKeys.has(key)) {
+          // Action results often echo unchanged fields from their input.
+          delete actionAppState[key];
+        }
+      }
+      this.trackDraftAppState(actionAppState);
+    }
+
+    // Leave text property edits in the draft until the label is submitted.
+    const deferCapture =
+      actionResult.elements &&
+      editingTextElement &&
+      editingTextElement.id === draft?.labelId;
+    this.store.scheduleAction(
+      deferCapture
+        ? CaptureUpdateAction.EVENTUALLY
+        : actionResult.captureUpdate,
+    );
 
     let didUpdate = false;
 
-    let editingTextElement: AppState["editingTextElement"] | null = null;
     if (actionResult.elements) {
       this.scene.replaceAllElements(actionResult.elements);
       didUpdate = true;
@@ -3165,12 +3725,15 @@ class App extends React.Component<AppProps, AppState> {
       this.addNewImagesToImageCache();
     }
 
-    if (actionResult.appState || editingTextElement || this.state.contextMenu) {
+    if (
+      actionResult.appState ||
+      discardingShapeLabel ||
+      this.state.contextMenu
+    ) {
       let viewModeEnabled = actionResult?.appState?.viewModeEnabled || false;
       let zenModeEnabled = actionResult?.appState?.zenModeEnabled || false;
       const theme =
         actionResult?.appState?.theme || this.props.theme || THEME.LIGHT;
-      const name = actionResult?.appState?.name ?? this.state.name;
       const errorMessage =
         actionResult?.appState?.errorMessage ?? this.state.errorMessage;
       if (typeof this.props.viewModeEnabled !== "undefined") {
@@ -3187,25 +3750,7 @@ class App extends React.Component<AppProps, AppState> {
         zenModeEnabled = this.props.zenModeEnabled;
       }
 
-      editingTextElement = actionResult.appState?.editingTextElement || null;
-
-      // make sure editingTextElement points to latest element reference
-      if (actionResult.elements && editingTextElement) {
-        const editingTextElementId = editingTextElement.id;
-        const nextElement = actionResult.elements.find(
-          (element) => element.id === editingTextElementId,
-        );
-        editingTextElement =
-          nextElement &&
-          isNonDeletedElement(nextElement) &&
-          isTextElement(nextElement)
-            ? nextElement
-            : null;
-      }
-
       this.setState((prevAppState) => {
-        const actionAppState = actionResult.appState || {};
-
         return {
           ...prevAppState,
           ...actionAppState,
@@ -3217,7 +3762,7 @@ class App extends React.Component<AppProps, AppState> {
           viewModeEnabled,
           zenModeEnabled,
           theme,
-          name,
+          name: actionAppState.name ?? prevAppState.name,
           errorMessage,
         };
       });
@@ -3571,6 +4116,8 @@ class App extends React.Component<AppProps, AppState> {
    */
   private resetScene = withBatchedUpdates(
     (opts?: { resetLoadingState: boolean }) => {
+      this.text.discardNewShapeLabel();
+      this.pendingDraftAppState = null;
       this.elementRenderOverrides = new Map();
       this.elementRenderOffsets = new Map();
       this.scene.replaceAllElements([]);
@@ -3921,6 +4468,7 @@ class App extends React.Component<AppProps, AppState> {
   }
 
   public componentWillUnmount() {
+    this.text.discardNewShapeLabel();
     // we're recreating the api object reference so that the
     // <ExcalidrawAPIContext.Provider/> picks up on it
     this.api = { ...this.api, isDestroyed: true };
@@ -4322,6 +4870,8 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
+    this.pendingDraftAppState = null;
+
     // must be updated *before* state change listeners are triggered below
     if (!this._initialized && !this.state.isLoading) {
       this._initialized = true;
@@ -4342,6 +4892,7 @@ class App extends React.Component<AppProps, AppState> {
 
     this.appStateObserver.flush(prevState);
 
+    this.discardInvalidShapeLabel();
     this.updateEmbeddables();
     const elements = this.scene.getElementsIncludingDeleted();
     const elementsMap = this.scene.getElementsMapIncludingDeleted();
@@ -4515,7 +5066,15 @@ class App extends React.Component<AppProps, AppState> {
       this.setState({ scrolledOutside });
     }
 
-    this.store.commit(elementsMap, this.state);
+    const draft = this.text.newShapeLabelDraft;
+    this.store.commit(
+      elementsMap,
+      this.state,
+      draft
+        ? (committed) =>
+            this.projectDraftElements(elementsMap, draft, { committed })
+        : undefined,
+    );
 
     // Do not notify consumers if we're still loading the scene. Among other
     // potential issues, this fixes a case where the tab isn't focused during
@@ -4672,7 +5231,61 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    const { nextElements, duplicatedElements } = duplication;
+    const { duplicatedElements } = duplication;
+    let { nextElements } = duplication;
+    const { editingTextElement } = this.state;
+    const submitText = this.text.textWysiwygSubmitHandler;
+    if (
+      submitText &&
+      editingTextElement &&
+      this.text.isEditingNewShapeLabel(editingTextElement.id)
+    ) {
+      // Submit only after the host accepts insertion. Keep the approved order
+      // and incorporate submission changes into any existing elements that
+      // the host returned as new objects.
+      const replacedElements = new Map<string, ExcalidrawElement>();
+      for (const element of nextElements) {
+        const current = this.scene.getElement(element.id);
+        if (current && current !== element) {
+          replacedElements.set(element.id, { ...current });
+        }
+      }
+
+      submitText();
+      nextElements = nextElements.map((element) => {
+        const submitted = this.scene.getElement(element.id);
+        if (!submitted || submitted === element) {
+          return element;
+        }
+
+        const beforeSubmit = replacedElements.get(element.id);
+        if (!beforeSubmit) {
+          return submitted;
+        }
+        if (beforeSubmit.version === submitted.version) {
+          return element;
+        }
+
+        const { deleted, inserted } = Delta.calculate(beforeSubmit, submitted);
+        Delta.diffArrays(deleted, inserted, "boundElements", ({ id }) => id);
+        const { boundElements, ...updates } = inserted;
+        return newElementWith(element, {
+          ...updates,
+          ...(boundElements?.length || deleted.boundElements?.length
+            ? {
+                boundElements: Delta.mergeArrays(
+                  element.boundElements,
+                  boundElements,
+                  deleted.boundElements,
+                  ({ id }) => id,
+                ),
+              }
+            : null),
+          version: Math.max(element.version, submitted.version) + 1,
+          versionNonce: undefined,
+        });
+      });
+    }
 
     this.scene.replaceAllElements(nextElements);
 
@@ -5010,9 +5623,43 @@ class App extends React.Component<AppProps, AppState> {
        */
       captureUpdate?: SceneData["captureUpdate"];
     }) => {
-      const { elements, appState, collaborators, captureUpdate } = sceneData;
+      const { appState, collaborators, captureUpdate } = sceneData;
+      const incoming = sceneData.elements;
+      const disposition = incoming
+        ? this.text.getIncomingShapeLabelDisposition(incoming)
+        : null;
+      const draftLabelId = this.text.newShapeLabelDraft?.labelId;
+      const elements =
+        incoming &&
+        (disposition === "discard" || disposition === "detach") &&
+        draftLabelId
+          ? incoming
+              .filter(
+                ({ id }) => disposition !== "discard" || id !== draftLabelId,
+              )
+              .map((element) => {
+                if (element.id === draftLabelId && isTextElement(element)) {
+                  return newElementWith(element, { containerId: null });
+                }
+                const bindings = element.boundElements?.filter(
+                  ({ id }) => id !== draftLabelId,
+                );
+                return bindings?.length !== element.boundElements?.length
+                  ? newElementWith(element, {
+                      boundElements: bindings?.length ? bindings : null,
+                    })
+                  : element;
+              })
+          : incoming;
 
-      if (captureUpdate) {
+      if (this.pendingDraftAppState || this.text.newShapeLabelDraft) {
+        this.scheduleDraftSceneUpdate(
+          appState ?? {},
+          captureUpdate,
+          elements,
+          disposition === "preserve" || disposition === "detach",
+        );
+      } else if (captureUpdate) {
         const nextElements = elements ? elements : undefined;
         const observedAppState = appState
           ? getObservedAppState({
@@ -5034,6 +5681,7 @@ class App extends React.Component<AppProps, AppState> {
 
       if (elements) {
         this.scene.replaceAllElements(elements);
+        this.discardInvalidShapeLabel();
       }
 
       if (collaborators) {
@@ -10986,16 +11634,26 @@ class App extends React.Component<AppProps, AppState> {
           });
           return;
         }
-        // restore the fractional indices by mutating elements
-        syncInvalidIndices(elements.concat(ret.data.elements));
-
-        // don't capture and only update the store snapshot for old elements,
-        // otherwise we would end up with duplicated fractional indices on undo
-        this.store.scheduleMicroAction({
-          action: CaptureUpdateAction.NEVER,
-          elements,
-          appState: undefined,
-        });
+        // Keep the old and new fractional indices distinct on undo, without
+        // capturing the index repair as an edit.
+        if (this.text.newShapeLabelDraft) {
+          const previous = this.scene
+            .getElementsIncludingDeleted()
+            .map((element) => ({ ...element }));
+          syncInvalidIndices(previous.concat(ret.data.elements));
+          this.scheduleDraftSceneUpdate(
+            {},
+            CaptureUpdateAction.NEVER,
+            previous,
+          );
+        } else {
+          syncInvalidIndices(elements.concat(ret.data.elements));
+          this.store.scheduleMicroAction({
+            action: CaptureUpdateAction.NEVER,
+            elements,
+            appState: undefined,
+          });
+        }
 
         this.setState({ isLoading: true });
         this.syncActionResult({

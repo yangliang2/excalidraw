@@ -107,8 +107,16 @@ export class Store {
    * Use to schedule a delta calculation, which will consquentially be emitted as `DurableStoreIncrement` and pushed in the undo stack.
    */
   // TODO: Suspicious that this is called so many places. Seems error-prone.
-  public scheduleCapture() {
-    this.scheduleAction(CaptureUpdateAction.IMMEDIATELY);
+  public scheduleCapture(shouldCapture?: (snapshot: StoreSnapshot) => boolean) {
+    if (shouldCapture) {
+      this.scheduledMicroActions.push(() => {
+        if (shouldCapture(this.snapshot)) {
+          this.scheduleAction(CaptureUpdateAction.IMMEDIATELY);
+        }
+      });
+    } else {
+      this.scheduleAction(CaptureUpdateAction.IMMEDIATELY);
+    }
   }
 
   /**
@@ -131,9 +139,25 @@ export class Store {
             | typeof CaptureUpdateAction.NEVER
             | typeof CaptureUpdateAction.EVENTUALLY;
           change: StoreChange;
+        }
+      | {
+          action: CaptureUpdateActionType;
+          resolveChange: (snapshot: StoreSnapshot) => StoreChange | null;
         },
   ) {
     const { action } = params;
+
+    if ("resolveChange" in params) {
+      // A projection may depend on changes from earlier entries in this
+      // batch. Its caller captures the inputs, and Store owns the baseline.
+      this.scheduledMicroActions.push(() => {
+        const change = params.resolveChange(this.snapshot);
+        if (change) {
+          this.processAction({ action, change, delta: undefined });
+        }
+      });
+      return;
+    }
 
     let change: StoreChange;
 
@@ -183,6 +207,7 @@ export class Store {
   public commit(
     elements: SceneElementsMap | undefined,
     appState: AppState | ObservedAppState | undefined,
+    projectElements?: (snapshot: StoreSnapshot) => SceneElementsMap,
   ): void {
     // execute all scheduled micro actions first
     // similar to microTasks, there can be many
@@ -192,7 +217,14 @@ export class Store {
       // execute a single scheduled "macro" function
       // similar to macro tasks, there can be only one within a single commit (loop)
       const action = this.getScheduledMacroAction();
-      this.processAction({ action, elements, appState });
+      this.processAction({
+        action,
+        elements:
+          projectElements && action !== CaptureUpdateAction.EVENTUALLY
+            ? projectElements(this.snapshot)
+            : elements,
+        appState,
+      });
     } finally {
       this.satisfiesScheduledActionsInvariant();
       // defensively reset all scheduled "macro" actions, possibly cleans up other runtime garbage
@@ -206,6 +238,7 @@ export class Store {
   public clear(): void {
     this.snapshot = StoreSnapshot.empty();
     this.scheduledMacroActions = new Set();
+    this.scheduledMicroActions.length = 0;
   }
 
   /**
